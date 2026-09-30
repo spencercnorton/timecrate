@@ -25,7 +25,7 @@ timeout 300 apt-get update -qq || { echo "[FAIL] apt-get update failed or timed 
 timeout 300 apt-get install -y -qq xvfb python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
   ${SHOT:+imagemagick x11-apps} || { echo "[FAIL] apt-get install failed or timed out"; exit 1; }
 
-REPO="${REPO:-${CI_PROJECT_DIR:-/repo}}"
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 GUI="$REPO/gui/timecrate-gui"
 
 # Stub CLI: the front-end must render from exactly what `timecrate` prints, so the stub is the

@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq zstd gpg python3 acl shellcheck sudo >/dev/null 2>&1   # sudo: break-glass extracts through it
 
-REPO="${REPO:-${CI_PROJECT_DIR:-/repo}}"
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 TC="$REPO/timecrate"
 export TIMECRATE_USER=root
 export TIMECRATE_CONF=/tmp/tm/conf
