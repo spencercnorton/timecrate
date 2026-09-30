@@ -12,7 +12,9 @@ no(){ echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq zstd gpg python3 acl shellcheck sudo >/dev/null 2>&1   # sudo: break-glass extracts through it
+# gpg-agent by name: an image where another package already pulled in gpg without its
+# recommends has no agent, and every key operation then fails.
+apt-get install -y -qq zstd gpg gpg-agent python3 acl shellcheck sudo >/dev/null 2>&1   # sudo: break-glass extracts through it
 
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 TC="$REPO/timecrate"
