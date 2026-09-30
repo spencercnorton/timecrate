@@ -1,0 +1,3017 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright 2026 Spencer Norton
+#
+# timecrate — lean, encrypted, hardware-accelerated disaster-recovery backup.
+#
+# Ships only the irreplaceable, uncovered, non-reproducible slice of the box (a few hundred MB)
+# to a cloud remote (rclone: Dropbox, B2, S3, 70+ backends), heavily compressed (zstd -T0 --long,
+# all cores) and encrypted (GPG public-key; AES-256 session cipher, hardware-accelerated wherever
+# AES-NI exists). Restore reinstalls the OS, replays a package manifest, then extracts the kit.
+# Break-glass needs only gpg + zstd + tar (see docs/BREAK-GLASS.md).
+set -euo pipefail
+
+VERSION="3.0.0"
+SELF="$(basename "$0")"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# ---- configuration ---------------------------------------------------------------------------
+# Precedence, strongest first:  environment  >  user config  >  root-only env file  >  system
+# config  >  built-in default.
+#
+# Before v1.5.0 the environment was the ONLY source, and /etc/timecrate.env was read by the
+# systemd units alone. So the scheduled backup used the deployed config while `status`, `list`,
+# the GUI and every hand-run restore/drill silently used the BUILT-IN defaults — a split brain
+# that made `status` report "0 KITS" against a path that no longer existed while 13 real kits sat
+# on the configured remote, and left the GUI unable to list (or restore) anything. Every entry
+# point loads the same files now.
+SYSTEM_CONF="${TIMECRATE_SYSTEM_CONF:-/etc/timecrate/timecrate.conf}"
+# Secrets (whatever credentials your alert or escrow-key command needs) stay in a root-only 0600
+# file — never in the world-readable conffile above. Unreadable (i.e. non-root) is normal and silently skipped.
+SECRET_ENV="${TIMECRATE_SECRET_ENV:-/etc/timecrate.env}"
+TC_CONF_SOURCES=""
+
+_tc_env_snapshot(){ local n; for n in $(compgen -v | grep '^TIMECRATE_' || true); do printf '%s\n' "$n=${!n}"; done; }
+# Re-export the TIMECRATE_* values that came from the real environment, so a one-off
+# `TIMECRATE_REMOTE=… timecrate list` still beats every config file.
+_tc_env_restore(){ local kv; for kv in "$@"; do [ -n "$kv" ] && export "${kv%%=*}=${kv#*=}"; done; return 0; }
+_tc_source_conf(){
+  [ -r "$1" ] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  . "$1"
+  set +a
+  TC_CONF_SOURCES="${TC_CONF_SOURCES:+$TC_CONF_SOURCES }$1"
+}
+mapfile -t _TC_ENV < <(_tc_env_snapshot)
+_tc_source_conf "$SYSTEM_CONF"
+_tc_source_conf "$SECRET_ENV"
+_tc_env_restore "${_TC_ENV[@]:-}"
+
+# TC_USER has to be resolved from the system config before the per-user config can be located.
+# sudo exports SUDO_USER; pkexec exports PKEXEC_UID and NOT SUDO_USER. The GUI runs every
+# privileged operation as `pkexec timecrate …`, so without the PKEXEC_UID arm this fell all the
+# way through to `id -un` = root on any box that had not pinned TIMECRATE_USER — and then backed
+# up root's home, out of root's empty keyring, silently, for restore as much as for backup.
+# PKEXEC_UID is not treated as a trust boundary and is not one: setting it requires already being
+# root, and root can set TIMECRATE_USER anyway. TC_USER_FROM exists so `config` can report which
+# of these answered rather than only what it answered — the resolved name alone reads as
+# deliberate, which is exactly how this went unnoticed.
+# TC_USER_PINNED records what resolution ACTUALLY used, and has to: the per-user config is sourced
+# below, after this runs, and it can set TIMECRATE_USER too late to have taken part. Re-reading
+# the variable further down would then call a fallback run "pinned" on the strength of a file that
+# was found only because of the fallback.
+if [ -n "${TIMECRATE_USER:-}" ]; then
+  TC_USER="$TIMECRATE_USER"; TC_USER_FROM="pinned by TIMECRATE_USER"; TC_USER_PINNED=1
+elif [ -n "${SUDO_USER:-}" ]; then
+  TC_USER="$SUDO_USER"; TC_USER_FROM="from SUDO_USER (sudo)"; TC_USER_PINNED=0
+elif [ -n "${PKEXEC_UID:-}" ] && TC_USER="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)" && [ -n "$TC_USER" ]; then
+  TC_USER_FROM="from PKEXEC_UID (pkexec)"; TC_USER_PINNED=0
+else
+  TC_USER="$(id -un)"; TC_USER_FROM="NOT pinned, and no sudo/pkexec caller to infer it from"; TC_USER_PINNED=0
+fi
+USER_HOME="$(getent passwd "$TC_USER" | cut -d: -f6 || true)"; : "${USER_HOME:?cannot resolve home for user '$TC_USER'}"
+USER_CONF="${TIMECRATE_USER_CONF:-$USER_HOME/.config/timecrate/timecrate.conf}"
+_tc_source_conf "$USER_CONF"
+_tc_env_restore "${_TC_ENV[@]:-}"
+
+CONF_DIR="${TIMECRATE_CONF:-$USER_HOME/.config/timecrate}"
+STATE_DIR="${TIMECRATE_STATE:-$USER_HOME/.local/state/timecrate}"
+# Staging defaults to a ROOT-OWNED base, not the user's home. Root writes archives here, and a
+# path the target user can rename cannot be made safe from a shell: every [ -L ] check is
+# point-in-time, and the user can swap the directory for a symlink between the check and the
+# write. The only reliable fix is for root never to write through a path that user controls.
+#
+# The reason it used to live under the home was so an unprivileged `verify` could write there.
+# `verify` now falls back to the user's own cache directory instead, which needs no shared
+# ownership at all. Existing installs that set TIMECRATE_STAGING keep whatever they set.
+STAGING_ROOT="${TIMECRATE_STAGING:-/var/lib/timecrate/staging}"
+# Packaged installs keep the file lists in /etc (dpkg conffiles, so local edits survive upgrades);
+# a source checkout falls back to the copies next to the script so `demo`/dev runs need no /etc.
+ETC_DIR="${TIMECRATE_ETC:-/etc/timecrate}"
+INCLUDE_FILE="${TIMECRATE_INCLUDE:-$([ -r "$ETC_DIR/include" ] && echo "$ETC_DIR/include" || echo "$HERE/timecrate.include")}"
+EXCLUDE_FILE="${TIMECRATE_EXCLUDE:-$([ -r "$ETC_DIR/exclude" ] && echo "$ETC_DIR/exclude" || echo "$HERE/timecrate.exclude")}"
+RECIPIENTS_FILE="${TIMECRATE_RECIPIENTS:-$CONF_DIR/recipients.txt}"
+GNUPGHOME_TC="${TIMECRATE_GNUPGHOME:-$CONF_DIR/gnupg}"
+SECRET_ESCROW="${TIMECRATE_SECRET:-$CONF_DIR/timecrate-secret.asc}"
+# kit signing (v1.3.0): a STANDALONE keypair, deliberately not a subkey of the encryption key —
+# harden deletes the encryption secret by fingerprint, and the signing secret must survive it
+# (an on-box signing secret adds no exposure: an on-box attacker already reads the plaintext).
+SIGNING_FILE="${TIMECRATE_SIGNING:-$CONF_DIR/signing.txt}"          # pinned signing-key fpr
+SIGNING_PUB="${TIMECRATE_SIGNING_PUB:-$CONF_DIR/timecrate-signing-public.asc}"
+# `-`, not `:-`: an explicitly empty TIMECRATE_REMOTE has to mean "no remote", or
+# `remote disconnect` silently re-arms this built-in default and the next backup uploads to a
+# path nobody chose. Unset still gets the default.
+REMOTE="${TIMECRATE_REMOTE-dropbox:TIMECRATE}"
+# second remote for 3-2-1 (different VENDOR, same rclone.conf): every kit is mirrored there and
+# pruned independently. Empty = disabled (configure the rclone remote, then set this).
+REMOTE2="${TIMECRATE_REMOTE2:-}"
+# rclone OAuth config lives in the user's home; backup runs as root, so point rclone at it explicitly.
+RCLONE_CONF="${TIMECRATE_RCLONE_CONF:-$USER_HOME/.config/rclone/rclone.conf}"
+KEEP="${TIMECRATE_KEEP:-14}"
+# GFS tiers on top of the daily window: first kit of each month / of each year survive the prune.
+# Weekly tier deliberately skipped — 14 dailies already cover it.
+KEEP_MONTHLY="${TIMECRATE_KEEP_MONTHLY:-12}"
+KEEP_YEARLY="${TIMECRATE_KEEP_YEARLY:-3}"
+MAX_MB="${TIMECRATE_MAX_MB:-2000}"   # size guard: refuse to ship a kit bigger than this
+MIN_MB="${TIMECRATE_MIN_MB:-25}"     # size floor: a near-empty kit means the include set collapsed
+ZSTD_LEVEL="${TIMECRATE_ZSTD_LEVEL:-19}"
+# zstd long-range window (power of 2). 27 = 128 MiB: fully covers a lean kit, yet decompresses in
+# ~128 MB RAM so recovery works on a small rescue box. --long=31 needed 2 GiB and OOM'd a 2 GB VM.
+ZSTD_LONG="${TIMECRATE_ZSTD_LONG:-27}"
+CIPHER="AES256"
+LOCKFILE="${TIMECRATE_LOCK:-/run/lock/timecrate.lock}"
+PREFIX="timecrate"
+# Kits written before 3.0.0 carry the previous name. They are the same series: every command that
+# lists, verifies, restores or prunes kits reads both names, and orders them by the timestamp that
+# follows the prefix -- by file name the two series would sort apart, and retention would then
+# keep the old kits as "newest" and delete the new ones.
+LEGACY_PREFIX="timemachine"
+KIT_GLOB="{${PREFIX},${LEGACY_PREFIX}}-*.tar.zst.gpg"
+MANIFESTS="TIMECRATE-MANIFESTS"
+LEGACY_MANIFESTS="TIMEMACHINE-MANIFESTS"
+# Repos whose LOCAL-ONLY commits would be lost (the kit archives working trees, not .git).
+# Space-separated paths; empty = no check.
+GIT_WATCH="${TIMECRATE_GIT_WATCH:-}"
+# Off-box escrow verification for `harden` (see cmd_harden). All optional: with none of them set,
+# harden's only route is the operator-attested --offbox-verified.
+ESCROW_SSH="${TIMECRATE_ESCROW_SSH:-}"                # user@host holding a copy of the escrow file
+ESCROW_SSH_KEY="${TIMECRATE_ESCROW_SSH_KEY:-}"        # ssh identity file (empty = ssh defaults)
+ESCROW_SSH_PATH="${TIMECRATE_ESCROW_SSH_PATH:-.timecrate/timecrate-secret.asc}"
+# ...or a command that prints the escrowed secret key from wherever you keep it (a password
+# manager's CLI, a secret store). Runs as root with /etc/timecrate.env in its environment. The
+# monthly drill decrypts with what it prints, and harden checks it before shredding anything.
+ESCROW_KEY_CMD="${TIMECRATE_ESCROW_KEY_CMD:-}"
+# Where alerts go: an executable run as  <cmd> <severity> <title> <key>  with the message on stdin
+# (see ALERTS in timecrate(1)). Unset: alerts are written to the system journal only.
+ALERT_CMD="${TIMECRATE_ALERT_CMD:-}"
+# Optional sibling-tool guard: warn when this string is absent from /etc/timeshift/timeshift.json
+# (a lost Timeshift exclude can balloon a snapshot by tens of gigabytes). Empty = off.
+TIMESHIFT_GUARD="${TIMECRATE_TIMESHIFT_GUARD:-}"
+
+log(){  printf '%s [timecrate] %s\n' "$(date -Is)" "$*"; }
+warn(){ printf '%s [timecrate][WARN] %s\n' "$(date -Is)" "$*" >&2; }
+die(){  printf '%s [timecrate][ERROR] %s\n' "$(date -Is)" "$*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# ---- kit names ---------------------------------------------------------------------------------
+# A kit is <prefix>-<YYYY-MM-DD_HH-MM-SS>.tar.zst.gpg under either prefix. These helpers are the
+# only code that knows that shape: nothing else sorts or compares kit names as plain strings.
+kit_ts(){      # <kit name or bare timestamp> -> the timestamp
+  local n="${1%.tar.zst.gpg}"
+  case "$n" in [0-9][0-9][0-9][0-9]-*) ;; *-*) n="${n#*-}";; esac
+  printf '%s' "$n"
+}
+kit_key(){ local t; t="$(kit_ts "$1")"; t="${t//[^0-9]/}"; t="${t:0:14}"; printf '%s' "${t:-0}"; }
+kit_older(){ [ "$(kit_key "$1")" -lt "$(kit_key "$2")" ]; }   # is kit $1 older than kit $2?
+kit_sort(){ LC_ALL=C sort -t- -k2; }                           # names on stdin, oldest first
+# The remote's file name for $2 -- a kit name of either series, or a bare timestamp. The answer is
+# always a name the listing produced, so nothing typed here reaches rclone as a path.
+resolve_kit(){
+  local remote="$1" want listing name
+  want="$(kit_ts "$2")"
+  rc_capture lsf "$remote" --include "$KIT_GLOB" || die "cannot list $remote: $RC_ERR"
+  listing="$RC_OUT"
+  while IFS= read -r name; do
+    [ -n "$name" ] && [ "$(kit_ts "$name")" = "$want" ] && { printf '%s' "$name"; return 0; }
+  done < <(printf '%s\n' "$listing" | kit_sort)
+  die "no such kit on $remote: $2"
+}
+
+# Fingerprint of the secret key TIMECRATE_ESCROW_KEY_CMD prints, read in a throwaway keyring.
+escrow_key_fpr(){
+  local t fpr
+  t="$(mktemp -d)"; chmod 700 "$t"
+  "$ESCROW_KEY_CMD" 2>/dev/null | GNUPGHOME="$t" gpg --batch --import >/dev/null 2>&1 || true
+  fpr="$(GNUPGHOME="$t" gpg --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+  gpgconf --homedir "$t" --kill gpg-agent >/dev/null 2>&1 || true
+  rm -rf "$t"
+  printf '%s' "$fpr"
+}
+
+# Nothing pinned the account and it landed on root anyway, so this run acts on root's own home and
+# root's own keyring. Mostly that is the systemd timer — the one path the PKEXEC_UID arm above
+# cannot help, and the one whose output nobody reads until a restore — but `sudo` run BY root gets
+# here too, which is why the reason quotes TC_USER_FROM rather than asserting that nothing
+# identified a caller: something may well have, and it still resolved to root unpinned. Keyed on
+# TC_USER_PINNED and not on TIMECRATE_USER, which by this line may have been set by the per-user
+# config sourced in between — a file reached only via /root because of the very fallback this is
+# meant to report. Said here rather than inside `backup` because `restore`, `recovery-drill` and
+# the key commands resolve the same home, and said on every command rather than only on `config`
+# because the scheduled run is precisely the one that never gets a `config` in front of it.
+if [ "$TC_USER" = root ] && [ "$TC_USER_PINNED" = 0 ]; then
+  warn "TIMECRATE_USER is not set and the account resolved to root ($TC_USER_FROM), so this run acts as ROOT: home=$USER_HOME, keyring=$GNUPGHOME_TC. That is almost never what you meant — set TIMECRATE_USER in $SYSTEM_CONF, then check with '$SELF config'."
+fi
+
+# rclone with the user's OAuth config (backup runs as root). A root-triggered token refresh
+# rewrites rclone.conf as root, which locks the user out of their own config — hand it back.
+rc(){
+  # There is no chown here any more, and that is the point.
+  #
+  # rclone needs the user's OAuth token. Running it as root against a config inside that user's
+  # home meant root rewrote the file on a token refresh and left it root-owned — so a chown was
+  # bolted on to hand it back. That chown was a check-then-act on a path whose ancestors the user
+  # controls, i.e. an escalation primitive, and `readlink -f` plus `chown -h` does not fix it:
+  # the ancestors are re-resolved at chown time, so the link can be swapped in between.
+  #
+  # A check-then-act on a user-controlled path cannot be made race-safe in shell, so do not do one.
+  # Root only ever opens a file it owns (a private temp copy). Both ends of the user's path — the
+  # read and, if the token was refreshed, the write-back — happen AS the user, with the user's own
+  # privileges, where there is nothing to escalate.
+  local r=0
+  if [ "$(id -u)" = 0 ] && [ "$TC_USER" != root ] && have runuser && [ -f "$RCLONE_CONF" ]; then
+    local cfg; cfg="$(mktemp)" || die "cannot create a temporary rclone config"
+    chmod 600 "$cfg"
+    runuser -u "$TC_USER" -- cat "$RCLONE_CONF" > "$cfg" 2>/dev/null || true
+    local before; before="$(sha256sum < "$cfg" 2>/dev/null || true)"
+    rclone --config "$cfg" "$@" || r=$?
+    if [ "$(sha256sum < "$cfg" 2>/dev/null || true)" != "$before" ]; then
+      # the token was refreshed: give it back by WRITING AS THE USER, never by chowning as root
+      local wberr; wberr="$(runuser -u "$TC_USER" -- sh -c 'cat > "$1"' _ "$RCLONE_CONF" < "$cfg" 2>&1)" \
+        || warn "rclone refreshed its token but writing it back to $RCLONE_CONF as $TC_USER failed (${wberr:-no error text}) — the next run may re-authenticate"
+    fi
+    rm -f "$cfg"
+  else
+    rclone --config "$RCLONE_CONF" "$@" || r=$?
+  fi
+  return $r
+}
+need_root(){ [ "$(id -u)" = 0 ] || die "'$1' must run as root:  sudo $SELF $1 ..."; }
+
+# rclone with its standard output in RC_OUT and its standard error kept apart, the last line of it
+# in RC_ERR; returns rclone's status. Wherever output is PARSED -- kit names, folder names, counts --
+# it must come through here: rclone writes notices to standard error ("Config file ... not found -
+# using defaults" on every run against a local path), and captured with 2>&1 each one read as one
+# more kit, which the verify sweep then failed to fetch and the window offered to restore.
+RC_OUT="" RC_ERR=""
+rc_capture(){
+  local errf r=0
+  errf="$(mktemp)" || die "cannot create a temporary file"
+  RC_OUT="$(rc "$@" 2>"$errf")" || r=$?
+  RC_ERR="$(grep . "$errf" | tail -1 || true)"
+  rm -f "$errf"
+  return "$r"
+}
+
+# STAGING_ROOT lives under the configured user's home, which means that user can replace it with
+# a symlink before a root-run backup reaches it. `mkdir -p` accepts an existing symlink-to-
+# directory and `chown` follows it, so "root creates it then hands it back" — the obvious fix for
+# the ownership bug this solves — would let a link to /etc hand /etc to that user.
+#
+# So root never creates it and never chowns it. The user creates it, under their own privileges,
+# in their own home; root only checks what it got. `chown -h` would stop the chown following a
+# link but every later write into staging would traverse it anyway, so a symlink is refused
+# outright rather than tolerated.
+#
+# On a box where TC_USER is already root-capable this is not an escalation, but the package ships
+# to other machines and TC_USER is configurable, so it is a real one there.
+# Is every ancestor of $1 controlled by root alone?
+#
+# This is the property that makes the rest safe, and it is deliberately a check about the PATH
+# rather than a check about the final component. Testing `[ -L "$STAGING_ROOT" ]` and then calling
+# mkdir is check-then-act: the user swaps the path in between, or redirects an ANCESTOR so the
+# final component was never a symlink at all. There is no way to win that race in shell.
+#
+# So do not race it. If every ancestor is root-owned and not group/other-writable, the user has
+# nowhere along the chain to plant or swap anything, and the check cannot be invalidated after it
+# passes — it is a statement about a chain nobody else can touch, not a snapshot of one component.
+# Walks the PHYSICAL path (pwd -P), so a symlinked ancestor is resolved before it is judged.
+path_root_controlled(){
+  local dir="$1"
+  # a not-yet-created path is judged by the deepest ancestor that does exist: root is about to
+  # create the rest, and nobody else can create anything inside a root-only directory first
+  while [ ! -e "$dir" ] && [ "$dir" != / ]; do dir="$(dirname "$dir")"; done
+  local phys; phys="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+  # Resolving must not have CHANGED the path. Otherwise a symlink somewhere in it pointed at a
+  # perfectly root-owned target and passed the ancestor walk below — while the link itself sat in
+  # a directory the user can rewrite, so they simply re-point it at the next run.
+  [ "$phys" = "$dir" ] || return 1
+  dir="$phys"
+  while :; do
+    local st owner mode
+    st="$(stat -c '%u %a' "$dir" 2>/dev/null)" || return 1
+    owner="${st%% *}"; mode="${st##* }"
+    [ "$owner" = 0 ] || return 1                          # owned by anyone else = they can swap it
+    [ "$(( 8#$mode & 0022 ))" -eq 0 ] || return 1         # group/other-writable = so can they
+    [ "$dir" = / ] && return 0
+    dir="$(dirname "$dir")"
+  done
+}
+
+# A pause is a mechanism for making backups not happen while everything still looks fine, which is
+# the exact failure class this tool's founding audit was about. Three rules keep it honest:
+#   1. it always expires — there is no indefinite pause, and the ceiling is deliberately low
+#   2. an expired pause is NOT a pause: the file is removed and the answer is no
+#   3. it only stops `backup`. The drill still runs, so the thing that proves the EXISTING kits
+#      are restorable keeps reporting while new ones are not being made.
+PAUSE_MAX_DAYS=30
+PAUSE_FILE="$STATE_DIR/paused"
+
+# echoes the expiry and returns 0 while a pause is in force; removes a lapsed one and returns 1
+pause_active(){
+  local until now exp
+  [ -r "$PAUSE_FILE" ] || return 1
+  until="$(head -1 "$PAUSE_FILE" 2>/dev/null || true)"
+  # a pause whose deadline cannot be read is treated as OVER, never as forever
+  exp="$(date -d "$until" +%s 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if [ -z "$until" ] || [ "$exp" -le "$now" ]; then
+    rm -f "$PAUSE_FILE" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s' "$until"
+}
+
+ensure_staging(){
+  # Root writes kits here. The check is skipped when TC_USER *is* root, because then there is no
+  # unprivileged account for anyone to escalate FROM — the whole concern is a user who is not root
+  # persuading root to write through a path they control.
+  if [ "$(id -u)" = 0 ] && [ "$TC_USER" != root ]; then
+    path_root_controlled "$STAGING_ROOT" || die "refusing to use $STAGING_ROOT: an ancestor of it is owned or writable by someone other than root, so $TC_USER could redirect it and have root write through the redirection. Use the default (/var/lib/timecrate/staging), or any path whose parent directories are root-owned and not group/other-writable."
+  fi
+  mkdir -p "$STAGING_ROOT" || die "could not create $STAGING_ROOT"
+  # 700 and root-owned: staging holds an unencrypted archive mid-build. Unprivileged commands do
+  # NOT get access here — `verify` works in the invoking user's own cache instead.
+  [ "$(id -u)" = 0 ] && chmod 700 "$STAGING_ROOT" 2>/dev/null || true
+  return 0
+}
+
+# Everything that has to talk to the cloud goes through here, so a disconnected machine says so
+# once, clearly, instead of failing later inside rclone with an empty path.
+require_remote(){
+  [ -n "$REMOTE" ] || die "no remote is configured on this machine. Point it at one with '$SELF remote set-path <remote:path>', or set one up with '$SELF remote connect'."
+}
+# Root running gpg against the CONFIGURED USER's keyring is the normal, intended case here: the
+# timers are root, and the keyring belongs to the user because that is what lets the front-end
+# read it at all. GnuPG calls that "unsafe ownership" and says so on every single run, which puts
+# a permanent warning in the backup log and teaches whoever reads it to skip warnings.
+#
+# Silenced ONLY when the ownership is exactly what we intend -- owned by TC_USER, mode 700. A
+# genuinely wrong mode, or a keyring owned by someone else entirely, still warns.
+gpg_perm_flag(){
+  [ "$(id -u)" = 0 ] || return 0
+  [ -d "$GNUPGHOME_TC" ] || return 0
+  [ "$(stat -c '%U %a' "$GNUPGHOME_TC" 2>/dev/null)" = "$TC_USER 700" ] || return 0
+  printf '%s' --no-permission-warning
+}
+gpg_tc(){
+  local perm; perm="$(gpg_perm_flag)"
+  GNUPGHOME="$GNUPGHOME_TC" gpg --batch --no-tty ${perm:+"$perm"} "$@"
+}
+
+# Decrypt $1 into FILE $2 and enforce the signature policy BEFORE anything extracts.
+# $3=1 allows an unsigned kit (the pre-v1.3.0 transition hatch — remove ~2026-08-06).
+#
+# This is deliberately NOT a streaming pipe: gpg only reports the signature at end-of-stream,
+# so `gpg -d | tar -x` would have written attacker-controlled bytes to disk (as root, for
+# --to-root) before the verdict arrives. Materialize → assert VALIDSIG → only then extract.
+# Exit code alone is useless here: `gpg -d` on a valid-but-UNSIGNED message exits 0.
+# Keyring: prefer the Timecrate keyring (original box), else the default keyring
+# (recovery box after `gpg --import` of the escrowed keys).
+decrypt_verified(){
+  # $3 = "report": decrypt and return 1 on an unverifiable signature instead of dying. Used ONLY
+  # by break-glass, which then declines to extract and hands over the raw commands. It is not a
+  # flag, not an environment variable, and nothing user-facing can reach it — the point of closing
+  # the hatch was to remove the ways an unsigned archive gets extracted, not to make it
+  # impossible to tell someone WHY theirs will not.
+  local kit="$1" out="$2" mode="${3:-}" st fpr expected
+  st="$(mktemp)"
+  local -a genv=()
+  # use the tool's keyring only when it can actually DECRYPT (an encrypt-capable secret, 'e'/'E' in
+  # the capability field) — post-harden the SURVIVING signing secret would otherwise keep
+  # selecting a keyring that can no longer decrypt, and the default-keyring fallback (the
+  # documented recovery path) would never fire
+  if [ -d "$GNUPGHOME_TC" ] && GNUPGHOME="$GNUPGHOME_TC" gpg --list-secret-keys --with-colons 2>/dev/null \
+       | awk -F: '($1=="sec"||$1=="ssb") && tolower($12) ~ /e/ {f=1} END{exit !f}'; then
+    genv=(env "GNUPGHOME=$GNUPGHOME_TC")
+  fi
+  local grc=0 gperm; gperm="$(gpg_perm_flag)"
+  "${genv[@]}" gpg --batch --no-tty ${gperm:+"$gperm"} --yes --status-file "$st" -o "$out" -d "$kit" || grc=$?
+  if [ "$grc" != 0 ] && ! grep -q '^\[GNUPG:\] DECRYPTION_OKAY' "$st"; then
+    # nonzero AND decryption did not complete = a real decrypt failure. (gpg also exits nonzero
+    # when decryption SUCCEEDED but the signer's public key is absent — that case falls through
+    # to the signature logic below for a truthful diagnosis.)
+    rm -f "$st"; die "decrypt FAILED for $kit (wrong key / truncated / corrupted)"
+  fi
+  # expected signer, most-explicit first: operator override (recovery of a pre-rotation kit) →
+  # pinned fpr file → fpr derived from the exported signing public key
+  expected="${TIMECRATE_EXPECT_SIGNER:-}"
+  [ -n "$expected" ] || expected="$(cat "$SIGNING_FILE" 2>/dev/null || true)"
+  [ -n "$expected" ] || expected="$(gpg --batch --show-keys --with-colons "$SIGNING_PUB" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}' || true)"
+  if grep -q '^\[GNUPG:\] VALIDSIG ' "$st"; then
+    fpr="$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' "$st")"; rm -f "$st"
+    if [ -z "$expected" ]; then
+      # an unpinned VALIDSIG proves only that SOME key in this keyring signed it — on a
+      # populated keyring that could be an attacker's key. Never trust it implicitly.
+      die "kit carries a valid signature ($fpr) but no expected signer is configured — cross-check that fingerprint against the escrow sheet, then rerun with TIMECRATE_EXPECT_SIGNER=$fpr"
+    fi
+    [ "$fpr" = "$expected" ] || die "kit signed by UNEXPECTED key $fpr (expected: $expected) — refusing to extract"
+    log "signature VERIFIED (signing key ${fpr})"
+  else
+    local errsig=0; grep -q '^\[GNUPG:\] ERRSIG ' "$st" && errsig=1
+    rm -f "$st"
+    if [ "$errsig" = 1 ]; then
+      [ "$mode" = report ] && return 1
+      die "kit IS signed but the signing PUBLIC key is not in this keyring — import timecrate-signing-public.asc (it is on the escrow sheet), then retry"
+    fi
+    [ "$mode" = report ] && return 1
+    # The --allow-unsigned transition window closed on 2026-07-31. Every kit on the remote is
+    # signed (drill sweep: 15/15, 0 unsigned), so the only things this could still admit are a
+    # forgery and a kit older than v1.3.0 — and for the latter there is break-glass, which is
+    # explicitly the raw, trust-nothing path. A hatch kept "just in case" past the date it was
+    # scheduled to close is just a permanently weaker signature check.
+    die "kit has NO signature — REFUSING to extract. Every backup this tool has made since v1.3.0 is signed, so an unsigned one is either tampered with or predates 2026-07-23. If you are certain it is a genuine pre-v1.3.0 archive, run '$SELF break-glass <file>': it prints the raw gpg/zstd/tar commands for it, which need no part of this tool and make no authenticity claim."
+  fi
+}
+
+require_tools(){
+  # `cloud` means "this command is about to use the remote", so it is the natural place to insist
+  # there is one. Commands that must still work WITHOUT a remote (status, config, connect) do not
+  # ask for cloud.
+  [ "${1:-}" = cloud ] && require_remote
+  local miss=() t
+  for t in tar zstd gpg sha256sum flock getent python3; do have "$t" || miss+=("$t"); done
+  [ "${1:-}" = cloud ] && { have rclone || miss+=(rclone); }
+  [ ${#miss[@]} -eq 0 ] || die "missing required tools: ${miss[*]}"
+}
+
+# Effective include list on stdout, relative to /, for `tar --files-from` (with -C /). tar recurses
+# directories fully by default — no trailing-slash gymnastics (unlike rsync --files-from, which
+# silently under-recurses).
+#   ~/…      expands against the CONFIGURED user's home, so a shipped list is portable across
+#            boxes and survives a username change; anything else is a path from /.
+#   * ? [    make a line a shell glob, expanded afresh at every run, so a file that appears later is
+#            picked up. A line naming an existing file literally is taken literally, whatever it
+#            contains. A glob that matches nothing adds nothing.
+# These are case PATTERNS matching a literal "~/" prefix; the expansion is done by hand below.
+# shellcheck disable=SC2088
+build_include(){
+  local line f
+  while IFS= read -r line; do
+    case "$line" in "~/"*) line="${USER_HOME#/}/${line#"~/"}";; esac
+    case "$line" in
+      *[*?[]*)
+        if [ -e "/$line" ] || [ -L "/$line" ]; then printf '%s\n' "$line"
+        else
+          while IFS= read -r f; do printf '%s\n' "${f#/}"; done < <(compgen -G "/$line" || true)
+        fi ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$INCLUDE_FILE")
+}
+
+# Effective exclude list: the static file plus exclusions that are DERIVED, never trusted to the
+# file. They used to be literal per-machine lines in the exclude file — correct on exactly one box,
+# and silently wrong for any other TIMECRATE_USER or relocated CONF_DIR. Shipping the decryption key
+# inside the kit it decrypts, or the rclone OAuth token that can delete every other kit, is not a
+# thing a hand-edited config file gets to opt out of. The last path is where releases before 3.0.0
+# kept the keyring and escrow file: a migrated machine keeps that copy until it is sure of the new
+# one, and the key must not ride in a kit meanwhile.
+build_exclude(){
+  sed "s|^~/|${USER_HOME#/}/|" "$EXCLUDE_FILE"
+  local p
+  for p in "$CONF_DIR" "$RCLONE_CONF" "$STAGING_ROOT" "$USER_HOME/.config/time-machine"; do
+    [ -n "$p" ] && printf '%s\n' "${p#/}"
+  done
+}
+
+recipient_args(){
+  [ -f "$RECIPIENTS_FILE" ] || die "no recipients file ($RECIPIENTS_FILE) — run '$SELF init' first"
+  local r rargs=()
+  while read -r r; do [ -n "$r" ] && [[ "$r" != \#* ]] && rargs+=(-r "$r"); done < "$RECIPIENTS_FILE"
+  [ ${#rargs[@]} -gt 0 ] || die "recipients file is empty"
+  printf '%s\n' "${rargs[@]}"
+}
+
+# shellcheck disable=SC2024  # sudo -u DROPS privilege to read user context; the redirects intentionally run as root (staging dir is root-owned)
+generate_manifests(){
+  local d="$1"; mkdir -p "$d/apt-keyrings"
+  local ruid; ruid="$(id -u "$TC_USER")"
+  # `cmd > file` creates the file BEFORE cmd runs, so a generator that fails still leaves an empty
+  # file behind — and every -f completeness check downstream then passes on it. That is the same
+  # silent degradation the check was added to catch, one layer down. Write to .part and rename only
+  # on success: an ABSENT file now means "the command failed", an EMPTY one means "none on this box",
+  # which is the distinction the kit_gap check below is trying to make.
+  gen(){ local out="$1"; shift
+         if "$@" > "$out.part" 2>/dev/null; then mv -f "$out.part" "$out"; else rm -f "$out.part"; fi; }
+  gen "$d/dpkg-selections.txt" dpkg --get-selections
+  gen "$d/apt-manual.txt"      apt-mark showmanual
+  # Foreign architectures, without which the documented replay ABORTS ENTIRELY rather than
+  # degrading: one selected package needing an unavailable i386 dependency makes apt refuse the
+  # whole transaction, so a rebuilt box installs ZERO of ~3000 packages while the file restore
+  # looks perfect. Found by the booted-VM capstone against a real kit, 2026-08-02.
+  gen "$d/dpkg-foreign-architectures.txt" dpkg --print-foreign-architectures
+  have snap    && gen "$d/snap-list.txt"    snap list
+  have flatpak && gen "$d/flatpak-list.txt" flatpak list
+  gen "$d/systemd-enabled-system.txt" systemctl list-unit-files --state=enabled --no-legend
+  gen "$d/lsblk.txt"          lsblk -f
+  gen "$d/blkid.txt"          blkid
+  gen "$d/kernel-cmdline.txt" cat /proc/cmdline
+  gen "$d/uname.txt"          uname -a
+  have mokutil && gen "$d/secureboot-state.txt" mokutil --sb-state
+  cp /etc/timeshift/timeshift.json "$d/" 2>/dev/null || true
+  # user-context manifests
+  gen "$d/dconf.ini" sudo -u "$TC_USER" dconf dump /
+  gen "$d/systemd-enabled-user.txt" sudo -u "$TC_USER" XDG_RUNTIME_DIR="/run/user/$ruid" \
+      systemctl --user list-unit-files --state=enabled --no-legend
+  gen "$d/user-crontab.txt"   sudo -u "$TC_USER" crontab -l
+  gen "$d/root-crontab.txt"   crontab -l
+  gen "$d/pipx-list.txt"      sudo -u "$TC_USER" pipx list --short
+  gen "$d/pip-user-list.txt"  sudo -u "$TC_USER" pip3 list --user
+  gen "$d/npm-global.txt"     npm ls -g --depth=0
+  gen "$d/os-release.txt"     cat /etc/os-release
+  # APT keyrings referenced by our sources — both one-line [signed-by=…] and deb822 `Signed-By:`
+  # (.sources, the Ubuntu 26.04 default). They live outside /etc, so a restored source list
+  # without them leaves apt update broken for every third-party repo.
+  {
+    grep -rhoE 'signed-by=[^]" ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+      | sed 's/^signed-by=//'
+    grep -rhiE '^Signed-By:' /etc/apt/sources.list.d/*.sources 2>/dev/null \
+      | sed -E 's/^[^:]+:[[:space:]]*//' | tr ' \t' '\n\n'
+  } | sort -u | while read -r k; do
+        [ -f "$k" ] && cp --parents "$k" "$d/apt-keyrings/" 2>/dev/null || true
+      done || true
+  printf 'timecrate %s @ %s on %s\n' "$VERSION" "$(date -Is)" "$(hostname)" > "$d/BACKUP-INFO.txt"
+}
+
+# Write a small NON-SECRET, user-readable status snapshot for the GUI/status command.
+write_status(){
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local fpr last drill nloc
+  fpr="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  last="$(grep ' ok ' "$STATE_DIR/log" 2>/dev/null | tail -1 | awk '{print $1" "$4}' || true)"
+  drill="$(grep ' drill ' "$STATE_DIR/log" 2>/dev/null | tail -1 | awk '{print $3" "$1}' || true)"
+  # field 5 (bytes) exists only on lines written by v1.9.0+. A pre-v1.9.0 line reports UNKNOWN,
+  # never 0 -- "this run recorded no size" and "this run shipped an empty kit" are not the same
+  # fact, and the GUI draws a size trend from these.
+  local lastb="" prevb="" oklines
+  oklines="$(grep -c ' ok ' "$STATE_DIR/log" 2>/dev/null || true)"
+  lastb="$(grep ' ok ' "$STATE_DIR/log" 2>/dev/null | tail -1 | awk '{print ($5 ~ /^[0-9]+$/) ? $5 : ""}' || true)"
+  if [ "${oklines:-0}" -ge 2 ]; then
+    prevb="$(grep ' ok ' "$STATE_DIR/log" 2>/dev/null | tail -2 | head -1 | awk '{print ($5 ~ /^[0-9]+$/) ? $5 : ""}' || true)"
+  fi
+  nloc="$(find "$STAGING_ROOT" -maxdepth 1 -name "${PREFIX}-*.tar.zst.gpg" 2>/dev/null | wc -l | tr -d ' ' || true)"
+  local exp_latest="" exp_count=0
+  if [ -r "$STATE_DIR/expected" ]; then
+    exp_latest="$(awk '{print $1}' "$STATE_DIR/expected" 2>/dev/null || true)"
+    exp_count="$(awk '{print $2}' "$STATE_DIR/expected" 2>/dev/null || true)"
+  fi
+  # built by python3 (already required by `status`) — a path or remote containing a quote would
+  # silently emit invalid JSON through printf, and the GUI would render "status unavailable"
+  if ! TC_JSON_VERSION="$VERSION" TC_JSON_REMOTE="$REMOTE" TC_JSON_REMOTE2="$REMOTE2" \
+       TC_JSON_FPR="$fpr" TC_JSON_ESCROW="$([ -f "$CONF_DIR/.escrow-confirmed" ] && echo true || echo false)" \
+       TC_JSON_LAST="$last" TC_JSON_DRILL="$drill" TC_JSON_NLOC="${nloc:-0}" TC_JSON_STAGING="$STAGING_ROOT" \
+       TC_JSON_LASTB="$lastb" TC_JSON_PREVB="$prevb" \
+       TC_JSON_EXPL="$exp_latest" TC_JSON_EXPC="${exp_count:-0}" TC_JSON_CONFSRC="$TC_CONF_SOURCES" \
+       TC_JSON_INC="$INCLUDE_FILE" TC_JSON_EXC="$EXCLUDE_FILE" TC_JSON_USER="$TC_USER" \
+       TC_JSON_GITWATCH="$GIT_WATCH" TC_JSON_PAUSED="$(pause_active || true)" \
+       TC_JSON_KEEP="$KEEP" TC_JSON_KEEPM="$KEEP_MONTHLY" TC_JSON_KEEPY="$KEEP_YEARLY" \
+       TC_JSON_MAXMB="$MAX_MB" TC_JSON_MINMB="$MIN_MB" TC_JSON_ZL="$ZSTD_LEVEL" \
+       python3 -c '
+import json, os
+e = os.environ.get
+def num(v, d=0):
+    try: return int(v)
+    except (TypeError, ValueError): return d
+print(json.dumps({
+  "version": e("TC_JSON_VERSION",""), "remote": e("TC_JSON_REMOTE",""), "remote2": e("TC_JSON_REMOTE2",""),
+  "cipher": "AES-256 (AES-NI)", "keytype": "RSA-4096", "key_fpr": e("TC_JSON_FPR",""),
+  "escrow_confirmed": e("TC_JSON_ESCROW") == "true",
+  "last_backup": e("TC_JSON_LAST",""), "drill_last": e("TC_JSON_DRILL",""),
+  # strings, not ints: "" is "not recorded", and a number here would have to invent a value for it
+  "last_backup_bytes": e("TC_JSON_LASTB",""), "previous_backup_bytes": e("TC_JSON_PREVB",""),
+  "local_kits": num(e("TC_JSON_NLOC")), "staging": e("TC_JSON_STAGING",""),
+  "expected_latest": e("TC_JSON_EXPL",""), "expected_kits": num(e("TC_JSON_EXPC")),
+  "conf_sources": e("TC_JSON_CONFSRC","").split(), "user": e("TC_JSON_USER",""),
+  "include_file": e("TC_JSON_INC",""), "exclude_file": e("TC_JSON_EXC",""),
+  # the repos watched for unpushed commits: the kit carries the working tree but not .git, so
+  # local-only commits are the one thing a "successful" backup silently does not save
+  "git_watch": e("TC_JSON_GITWATCH",""),
+  # "" when not paused. The GUI raises this above the success banner: a paused machine that looks
+  # healthy is the failure this whole feature had to be designed around.
+  "paused_until": e("TC_JSON_PAUSED",""),
+  "keep": num(e("TC_JSON_KEEP"),14), "keep_monthly": num(e("TC_JSON_KEEPM"),12),
+  "keep_yearly": num(e("TC_JSON_KEEPY"),3), "max_mb": num(e("TC_JSON_MAXMB"),2000),
+  "min_mb": num(e("TC_JSON_MINMB"),25), "zstd_level": num(e("TC_JSON_ZL"),19),
+}))' > "$STATE_DIR/status.json" 2>/dev/null; then
+    warn "cannot write $STATE_DIR/status.json — status/GUI will show STALE data (fix: chown -R $TC_USER: $STATE_DIR)"
+  fi
+  chmod 755 "$STATE_DIR" 2>/dev/null || true; chmod 644 "$STATE_DIR/status.json" 2>/dev/null || true
+}
+
+# ============================ subcommands ============================
+
+cmd_init(){
+  local new_identity=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --new-identity) new_identity=1;;
+    --*) die "unknown init flag: $1";;
+  esac; shift; done
+
+  # The one-way door. On a machine with no key, generating one is right for a NEW install and
+  # catastrophic for a REINSTALL: every kit already on the remote is encrypted to the old key, and
+  # a fresh keypair here means nothing will ever read them again. So look before minting.
+  #
+  # An unreachable remote is not an empty one (the v1.5.0 lesson). Refuse ONLY on a remote that
+  # was listed successfully and came back non-empty; offline, headless and not-yet-configured all
+  # proceed, because a rescue box with no network still has to be able to set itself up. Kits of
+  # both series count: a remote holding only pre-3.0.0 kits is exactly as unreadable to a new key.
+  if [ ! -s "$RECIPIENTS_FILE" ] && ! keyring_readable; then
+    die "$(keyring_blocker) exists but is not readable by $(id -un) — this machine may already have a key that you simply cannot see. Check with 'sudo $SELF keys' before generating anything."
+  fi
+  if [ ! -s "$RECIPIENTS_FILE" ] && [ "$new_identity" != 1 ] && [ -n "$REMOTE" ] && have rclone; then
+    local listing lrc=0
+    listing="$(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null)" || lrc=$?
+    if [ "$lrc" != 0 ]; then
+      warn "could not reach $REMOTE to check for existing backups — continuing (an unreachable remote is not an empty one)"
+    else
+      local n; n="$(printf '%s' "$listing" | grep -c . || true)"
+      if [ "${n:-0}" -gt 0 ]; then
+        die "$REMOTE already holds $n backup(s), but this machine has no key.
+  Generating one now would leave every one of them unreadable, permanently.
+  Recovering this machine?   $SELF import-key <escrowed secret key>
+  Really starting over?      $SELF init --new-identity   (abandons those $n backups)"
+      fi
+    fi
+  fi
+
+  # No staging here: init runs as the user, staging is root-owned, and a fresh install does not
+  # have it yet -- the first root backup creates it. Asking for it here made init die on every
+  # new machine where no root command had run first.
+  umask 077; mkdir -p "$CONF_DIR" "$GNUPGHOME_TC" "$STATE_DIR"
+  chmod 700 "$GNUPGHOME_TC"
+  local host; host="$(hostname -s 2>/dev/null || true)"; host="${host:-localhost}"
+  if [ -f "$RECIPIENTS_FILE" ] && [ -s "$RECIPIENTS_FILE" ]; then
+    log "recipients already configured ($RECIPIENTS_FILE):"; cat "$RECIPIENTS_FILE"
+  else
+    log "generating Timecrate keypair (RSA-4096, NO passphrase so the escrowed key decrypts on ANY"
+    log "  machine with a plain 'gpg -d'; AES-256 session cipher = AES-NI). One-time, ~5-15s…"
+    # RSA, not ECC: exported ed25519/cv25519 secret keys fail to decrypt after re-import in this
+    # GnuPG (verified) — catastrophic for a wiped-OS recovery tool. RSA export/import is rock-solid.
+    gpg_tc --gen-key <<KEYSPEC
+%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Key-Usage: cert
+Subkey-Type: RSA
+Subkey-Length: 4096
+Subkey-Usage: encrypt
+Name-Real: Timecrate (disaster recovery)
+Name-Email: timecrate@$host
+Expire-Date: 0
+%commit
+KEYSPEC
+    local fpr; fpr="$(gpg_tc --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+    printf '%s\n' "$fpr" > "$RECIPIENTS_FILE"
+    gpg_tc --armor --export "$fpr"             > "$CONF_DIR/timecrate-public.asc"
+    gpg_tc --armor --export-secret-keys "$fpr" > "$SECRET_ESCROW"
+    chmod 600 "$SECRET_ESCROW"
+    log "recipient fingerprint: $fpr"
+  fi
+  # signing keypair (v1.3.0) — idempotent: existing installs get it on their next `init` run
+  local sfpr
+  sfpr="$(cat "$SIGNING_FILE" 2>/dev/null || true)"
+  if [ -n "$sfpr" ] && gpg_tc --list-secret-keys "$sfpr" >/dev/null 2>&1; then
+    log "signing key already configured: $sfpr"
+  else
+    log "generating STANDALONE signing keypair (RSA-4096; not a subkey — must survive 'harden')…"
+    # KEY_CREATED gives gpg's own answer for the new fpr — race-free (no before/after diff)
+    sfpr="$(gpg_tc --status-fd 1 --gen-key <<KEYSPEC | awk '/^\[GNUPG:\] KEY_CREATED/{print $4; exit}'
+%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Key-Usage: sign
+Name-Real: Timecrate Signing
+Name-Email: timecrate-sign@$host
+Expire-Date: 0
+%commit
+KEYSPEC
+)"
+    [ -n "$sfpr" ] || die "could not determine the new signing key fingerprint (no KEY_CREATED)"
+    printf '%s\n' "$sfpr" > "$SIGNING_FILE"
+    gpg_tc --armor --export "$sfpr" > "$SIGNING_PUB"
+    chmod 644 "$SIGNING_PUB"
+    log "signing key: $sfpr — every kit is now signed; restore verifies BEFORE extracting."
+    log "PUBLIC key exported to $SIGNING_PUB — add it to the escrow sheet ('$SELF escrow-doc')"
+    log "  and keep a copy beside the escrowed secret key. It is public: no secret escrow needed."
+  fi
+  cat <<EOF
+
+  ┌─ ESCROW THE DECRYPTION KEY (do this NOW) ────────────────────────────────┐
+  │ The secret key is the ONLY thing that can decrypt your backups.           │
+  │ It is NOT in the backups (chicken-and-egg). Copy it OFF this machine:     │
+  │                                                                           │
+  │     $SECRET_ESCROW
+  │                                                                           │
+  │   → password manager / printed / USB kept off this machine.                     │
+  │ Then optionally run:  sudo $SELF harden   (deletes the on-box secret key  │
+  │   so this box can only ENCRYPT, never decrypt — compromise-resistant).      │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  Cloud remote: configure once with  $SELF remote connect  (rclone remote '${REMOTE%%:*}').
+  Current REMOTE target: $REMOTE
+EOF
+  write_status
+}
+
+cmd_harden(){
+  # "Encrypt-only" is only true if the on-box escrow FILE goes too — deleting the keyring entry
+  # while timecrate-secret.asc stays on disk leaves the box one `gpg --import` from decrypting
+  # everything. But shredding that file is the one irreversible act in this tool, so it is gated:
+  # escrow must be confirmed, and the operator must verify an off-box copy hash interactively.
+  [ -f "$SECRET_ESCROW" ] || die "escrow file $SECRET_ESCROW missing — refusing to harden before you have it"
+  read_escrow
+  # A marker that cannot name the key it confirmed is not a confirmation for THIS key. Both the
+  # missing case and the pre-1.7.0 unnamed case have to fail here: harden is the one irreversible
+  # act in this tool, and "someone confirmed something once" is not a basis for it.
+  local _cur; _cur="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  case "$ESC_STATE" in
+    none)
+      die "escrow NOT confirmed — run '$SELF recovery-drill' (ideally with an off-box key copy), then 'sudo $SELF escrow-confirm', before hardening";;
+    unknown)
+      die "the escrow marker predates v1.7.0 and does not record WHICH key it confirmed. Hardening destroys the only on-box copy of $_cur, so that marker is not enough: re-escrow it ('$SELF export-key --out <file>'), move that file off this machine, then 'sudo $SELF escrow-confirm' and try again";;
+    confirmed)
+      [ "$ESC_FPR" = "$_cur" ] || die "escrow was confirmed for $ESC_FPR but the current key is $_cur — re-escrow ('$SELF export-key --out <file>') and re-confirm before hardening";;
+  esac
+  local fpr h; fpr="$(head -1 "$RECIPIENTS_FILE")"
+  h="$(sha256sum "$SECRET_ESCROW" | cut -d' ' -f1)"
+
+  # PROGRAMMATIC off-box verification — .escrow-confirmed can be satisfied by an on-box drill,
+  # so before the one irreversible act we independently prove a wipe-surviving copy exists NOW.
+  # --offbox-verified skips this only for the air-gapped case (printed sheet verified by hand).
+  local verified=""
+  if [ "${1:-}" = --offbox-verified ]; then
+    verified="operator-attested via --offbox-verified (printed sheet)"
+  else
+    if [ -n "$ESCROW_SSH" ]; then
+      local remote_h; local -a idargs=()
+      [ -n "$ESCROW_SSH_KEY" ] && idargs=(-i "$ESCROW_SSH_KEY")
+      remote_h="$(timeout 15 sudo -u "$TC_USER" ssh "${idargs[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
+              "$ESCROW_SSH" "sha256sum '$ESCROW_SSH_PATH' 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+      [ "$remote_h" = "$h" ] && verified="off-box copy on $ESCROW_SSH matches (sha256)"
+    fi
+    if [ -z "$verified" ] && [ -n "$ESCROW_KEY_CMD" ]; then
+      # A secret store reached through a command of your own. Compared by fingerprint, not by
+      # bytes: a store may hand the armor back re-wrapped.
+      [ "$(escrow_key_fpr)" = "$fpr" ] && verified="TIMECRATE_ESCROW_KEY_CMD returns secret key $fpr"
+    fi
+    [ -n "$verified" ] || die "could not verify ANY off-box escrow copy (${ESCROW_SSH:+$ESCROW_SSH unreachable or mismatched; }${ESCROW_KEY_CMD:+TIMECRATE_ESCROW_KEY_CMD did not return this key; }set TIMECRATE_ESCROW_SSH or TIMECRATE_ESCROW_KEY_CMD) — fix that first, or hand-verify the printed sheet and rerun: sudo $SELF harden --offbox-verified"
+  fi
+
+  cat <<EOF
+
+  harden deletes the on-box secret key AND shreds the on-box escrow file:
+      $SECRET_ESCROW
+  After this, ONLY off-box escrow copies can ever decrypt a backup.
+
+  Off-box escrow verified: $verified
+  Escrow sha256 (for your own cross-check): $h
+  (every copy you hold — another machine, a secret manager, the printed escrow sheet — is now
+   the ONLY way back. Confirm you can still reach at least two of them.)
+
+EOF
+  local ans=""; printf 'Type SHRED to proceed (anything else aborts): '
+  read -r ans || die "no confirmation input — aborted, nothing deleted"
+  [ "$ans" = SHRED ] || die "aborted — nothing deleted"
+  gpg_tc --pinentry-mode loopback --passphrase '' --yes --delete-secret-keys "$fpr"
+  if have shred; then shred -u -- "$SECRET_ESCROW"
+  else rm -f -- "$SECRET_ESCROW"; warn "shred unavailable — used rm; a journaled fs may retain old blocks"; fi
+  log "on-box secret key deleted + escrow file shredded (was sha256 $h). This box is now encrypt-only."
+  log "the scheduled drill now needs an off-box key — set TIMECRATE_ESCROW_KEY_CMD (see timecrate(1))."
+}
+
+# Trap-owned globals: single-quoted traps expand at RUN time, so they must reference globals —
+# a `local` would already be out of scope when EXIT fires on normal completion (SC2064-clean).
+TC_TMP=""
+# EXIT-time cleanup for cmd_backup. A failed run must leave neither the staging dir nor a
+# half-written kit behind (ENOSPC spiral).
+BK_STAGE="" BK_KEEP_STAGE=0
+BK_UNCOMMITTED=()
+backup_cleanup(){
+  [ "$BK_KEEP_STAGE" = 1 ] || { [ -n "$BK_STAGE" ] && rm -rf -- "$BK_STAGE"; }
+  local f; for f in "${BK_UNCOMMITTED[@]:-}"; do [ -n "$f" ] && rm -f -- "$f"; done
+  return 0
+}
+
+cmd_backup(){
+  need_root backup
+  local dry=0 upload=1 keep_staging=0 force=0 a
+  for a in "$@"; do case "$a" in
+    --dry-run) dry=1;; --no-upload) upload=0;; --keep-staging) keep_staging=1;; --force) force=1;;
+    *) die "unknown backup flag: $a";; esac; done
+  local mode=""; if [ "$upload" = 1 ] && [ "$dry" = 0 ]; then mode=cloud; fi
+  require_tools "$mode"
+  exec 9>"$LOCKFILE"; flock -n 9 || die "another timecrate run holds the lock ($LOCKFILE)"
+  local t0; t0="$(date +%s)"   # wall-clock for the state-log line; SECONDS would count the shell, not the run
+
+  # The package before 3.0.0 ran under another name, with its own timer and its own lock. Two
+  # tools uploading to and pruning one remote each count the other's kits and delete kits early,
+  # so while that timer is armed this refuses to upload. Local runs are unaffected.
+  if [ "$mode" = cloud ] && have systemctl \
+     && { systemctl is-active --quiet time-machine-backup.timer 2>/dev/null \
+          || systemctl is-enabled --quiet time-machine-backup.timer 2>/dev/null; }; then
+    die "the previous package's backup timer (time-machine-backup.timer) is still armed, and two tools pruning one remote would delete kits early. Disarm it first: sudo systemctl disable --now time-machine-backup.timer (see docs/MIGRATING.md)"
+  fi
+
+  # Exits 0, deliberately: a scheduled run that is paused ON PURPOSE is not a failure and must not
+  # page anyone. It is a WARN so it still outranks the success banner in the window, and `status`
+  # keeps saying PAUSED — the operator is never left with a quiet green screen and no backups.
+  local _pu
+  if _pu="$(pause_active)"; then
+    if [ "$force" = 1 ]; then
+      warn "backups are PAUSED until $_pu — running anyway because --force was given"
+    else
+      warn "backups are PAUSED until $_pu — skipping this run (clear it with 'sudo $SELF pause off', or override with --force)"
+      return 0
+    fi
+  fi
+
+  # a fresh install with no config backs up root's home to a default remote name — say so once
+  # rather than shipping a confidently wrong kit
+  [ -n "$TC_CONF_SOURCES" ] || warn "no config file loaded (looked in $SYSTEM_CONF, $USER_CONF) — running entirely on built-in defaults: user=$TC_USER remote=$REMOTE. Run '$SELF config' to check."
+  # a vanished or unreadable include/exclude list must fail LOUD here — fed silently to tar it
+  # produces a hollow kit that still uploads `ok` and then ages out the real ones
+  [ -r "$INCLUDE_FILE" ] || die "include file missing/unreadable: $INCLUDE_FILE"
+  [ -r "$EXCLUDE_FILE" ] || die "exclude file missing/unreadable: $EXCLUDE_FILE"
+  # a typo'd size env (e.g. "25MB") would make [ -lt ] error and silently skip BOTH rails
+  case "${MIN_MB}${MAX_MB}" in *[^0-9]*|'') die "TIMECRATE_MIN_MB/MAX_MB must be plain integers (MB) — got MIN=$MIN_MB MAX=$MAX_MB";; esac
+  # static entries that no longer exist would be dropped silently by --ignore-failed-read. ~/ is
+  # expanded first -- checked raw, every ~/ line read as missing, nightly, and the warning that
+  # mattered drowned among ones that did not. Globs are exempt: matching nothing is allowed.
+  local p
+  while IFS= read -r p; do
+    case "$p" in *[*?[]*) continue;; esac
+    [ -e "/$p" ] || [ -L "/$p" ] || warn "include entry missing on disk: /$p — it will NOT be in the kit"
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$INCLUDE_FILE" | sed "s|^~/|${USER_HOME#/}/|")
+
+  # preflight guards (crypto checks skipped in --dry-run: it only previews the file set)
+  local sfpr=""
+  if [ "$dry" = 0 ]; then
+    [ -f "$RECIPIENTS_FILE" ] || die "run '$SELF init' first"
+    GNUPGHOME="$GNUPGHOME_TC" gpg --list-keys "$(head -1 "$RECIPIENTS_FILE")" >/dev/null 2>&1 \
+      || die "recipient public key not in keyring $GNUPGHOME_TC"
+    # signing is REQUIRED as of v1.3.0 — an unsigned kit is indistinguishable from a forged one
+    sfpr="$(cat "$SIGNING_FILE" 2>/dev/null || true)"
+    { [ -n "$sfpr" ] && GNUPGHOME="$GNUPGHOME_TC" gpg --list-secret-keys "$sfpr" >/dev/null 2>&1; } \
+      || die "signing key missing — run 'sudo $SELF init' once to mint it (v1.3.0 signs every kit)"
+    [ -f "$CONF_DIR/.escrow-confirmed" ] || warn "KEY ESCROW NOT CONFIRMED — if the secret key is lost these backups are unrecoverable. Prove it with '$SELF recovery-drill', then '$SELF escrow-confirm'."
+    # data-completeness guard: local-only git work NOT in the kit (kit excludes .git → unpushed commits are lost)
+    local gd
+    for gd in $GIT_WATCH; do
+      [ -d "$gd/.git" ] || continue
+      if [ -z "$(sudo -u "$TC_USER" git -C "$gd" remote 2>/dev/null)" ]; then
+        warn "git gap: $gd has NO remote — its commits exist only here, not in the kit (.git is excluded)"
+      # --branches --not --remotes catches every local-only commit, including branches with no
+      # upstream configured ('@{u}..' errors out on those and the gap went unseen)
+      elif [ "$(sudo -u "$TC_USER" git -C "$gd" log --oneline --branches --not --remotes 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
+        warn "git gap: $gd has unpushed commit(s) — push them; the kit backs up the working tree but not .git"
+      fi
+    done
+  fi
+  if [ -n "$TIMESHIFT_GUARD" ] && [ -f /etc/timeshift/timeshift.json ] \
+     && ! grep -q "$TIMESHIFT_GUARD" /etc/timeshift/timeshift.json; then
+    warn "the '$TIMESHIFT_GUARD' exclude guard is missing from timeshift.json"
+  fi
+  ensure_staging
+  # sweep debris from crashed runs (>24h old), and require headroom BEFORE tar hits ENOSPC.
+  # Deliberately-kept dirs are renamed OUT of these patterns (restored-*/kept-stage-*), so the
+  # sweep only ever matches crash debris.
+  find "$STAGING_ROOT" -maxdepth 1 \( -name '.stage.*' -o -name '.restore.*' -o -name '*.part' \) -mmin +1440 \
+    -exec rm -rf -- {} + 2>/dev/null || true
+  local free_mb
+  free_mb="$(df -Pm "$STAGING_ROOT" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  [ "${free_mb:-0}" -ge "$MAX_MB" ] || die "staging fs has ${free_mb:-?}MB free < ${MAX_MB}MB cap — clear $STAGING_ROOT (or old kits) first"
+
+  local ts stage man kit sha meta
+  ts="$(date +%Y-%m-%d_%H-%M-%S)"
+  local -a TARBASE=(--numeric-owner --acls --xattrs --sparse -p
+                    --ignore-failed-read --warning=no-file-changed --warning=no-file-removed)
+
+  if [ "$dry" = 1 ]; then
+    log "DRY RUN — kit size + top-level members (nothing archived/uploaded):"
+    # NB: --exclude-from MUST precede --files-from or tar silently ignores it.
+    tar "${TARBASE[@]}" --exclude-from=<(build_exclude) -cf /dev/null --totals \
+        -C / --files-from=<(build_include) 2>&1 | grep -i 'Total bytes' || true
+    tar "${TARBASE[@]}" --exclude-from=<(build_exclude) -cf - -C / --files-from=<(build_include) 2>/dev/null \
+        | tar -tf - 2>/dev/null | cut -d/ -f1-3 | sort | uniq -c | sort -rn | head -30
+    return 0
+  fi
+
+  # size guard — a mis-set include (e.g. a 73G subtree) must NEVER silently ship to the cloud.
+  # tar's stderr is captured whole: a fatal tar (exit 2, e.g. bad exclude file) must die WITH its
+  # error, not vanish into an unparsable pipeline and ship a zero-byte count.
+  local sizeout bytes mb
+  sizeout="$(tar "${TARBASE[@]}" --exclude-from=<(build_exclude) -cf /dev/null --totals \
+            -C / --files-from=<(build_include) 2>&1 || true)"
+  bytes="$(printf '%s\n' "$sizeout" | grep -i 'total bytes' | grep -oE '[0-9]+' | head -1 || true)"
+  [ -n "$bytes" ] || die "size-guard tar produced no byte count — tar said: $(printf '%s' "$sizeout" | tail -3 | tr '\n' '|')"
+  mb=$(( bytes / 1024 / 1024 ))
+  log "staged (uncompressed) size: ${mb} MB (floor ${MIN_MB} MB, cap ${MAX_MB} MB)"
+  if [ "$mb" -gt "$MAX_MB" ] && [ "$force" != 1 ]; then
+    die "staged ${mb}MB exceeds cap ${MAX_MB}MB — check includes/excludes, or pass --force / set TIMECRATE_MAX_MB"
+  fi
+  # …and a near-empty kit means the include set collapsed (vanished dirs, bad edit): shipping it
+  # would replace real backups with hollow ones while every check stays green.
+  if [ "$mb" -lt "$MIN_MB" ] && [ "$force" != 1 ]; then
+    die "staged ${mb}MB is under the ${MIN_MB}MB floor — include set collapsed? Check $INCLUDE_FILE, or pass --force / set TIMECRATE_MIN_MB"
+  fi
+
+  stage="$(mktemp -d "$STAGING_ROOT/.stage.$ts.XXXX")"; man="$stage/$MANIFESTS"
+  BK_STAGE="$stage" BK_KEEP_STAGE="$keep_staging"
+  trap backup_cleanup EXIT
+  log "generating manifests…"; generate_manifests "$man"
+  # A kit that encrypts, uploads and hashes perfectly but is missing a manifest the restore path
+  # needs is the failure mode that cost thirteen kits their package replay: every write in
+  # generate_manifests is best-effort (`|| true`), so "the command failed" and "this box has none
+  # of those" produce the identical empty-or-absent file. Nothing checked, so nothing noticed for
+  # weeks — until a booted VM replayed zero packages.
+  #
+  # This does NOT abort the backup. A night with files but no package list is worth far more than
+  # no night at all, and the files are the irreplaceable half. It pages instead, via the same
+  # REMOTE-ALERT marker backup-and-alert.sh already escalates as critical.
+  #
+  # Split deliberately: some manifests are legitimately EMPTY on a healthy box (a machine with no
+  # foreign architectures), so for those only absence is a defect.
+  kit_gap=""
+  for m in dpkg-selections.txt os-release.txt; do
+    [ -s "$man/$m" ] || kit_gap="$kit_gap $m(empty)"
+  done
+  for m in dpkg-foreign-architectures.txt apt-manual.txt; do
+    [ -f "$man/$m" ] || kit_gap="$kit_gap $m(absent)"
+  done
+  [ -z "$kit_gap" ] || warn "REMOTE-ALERT: kit is INCOMPLETE — restore from it will be degraded; manifest(s):$kit_gap"
+
+  kit="$STAGING_ROOT/${PREFIX}-${ts}.tar.zst.gpg"
+  # write to .part and mv only after the pipeline's exit codes check out: SIGKILL/power-loss
+  # (no EXIT trap) then leaves a sweepable *.part, never a plausible-looking half-kit
+  BK_UNCOMMITTED=("$kit.part")
+  log "archive (tar full-fidelity) → zstd -T0 --long=$ZSTD_LONG -$ZSTD_LEVEL → gpg $CIPHER (AES-NI)…"
+  local -a recips; mapfile -t recips < <(recipient_args)
+  # tar exits 1 on 'file changed while reading' (normal on a live system) — tolerate 1, catch fatal 2.
+  # This is the gpg the nightly log shows; gpg_tc is not on this path. Missing it left the
+  # "unsafe ownership" line in every backup while the restore path was already quiet.
+  local bperm; bperm="$(gpg_perm_flag)"
+  set +e
+  tar "${TARBASE[@]}" --exclude-from=<(build_exclude) -cf - \
+        -C / --files-from=<(build_include) \
+        -C "$stage" "$MANIFESTS" \
+    | zstd -T0 --long=$ZSTD_LONG "-$ZSTD_LEVEL" \
+    | GNUPGHOME="$GNUPGHOME_TC" gpg --batch --yes --trust-model always ${bperm:+"$bperm"} \
+        --cipher-algo "$CIPHER" --compress-algo none \
+        --sign -u "$sfpr" -e "${recips[@]}" -o "$kit.part"
+  local -a rc=("${PIPESTATUS[@]}"); set -e
+  [ "${rc[0]:-9}" -le 1 ] || die "tar failed (exit ${rc[0]})"
+  [ "${rc[1]:-9}" = 0 ]   || die "zstd failed (exit ${rc[1]})"
+  [ "${rc[2]:-9}" = 0 ]   || die "gpg failed (exit ${rc[2]})"
+  mv "$kit.part" "$kit"
+
+  sha="$kit.sha256"; ( cd "$STAGING_ROOT" && sha256sum "$(basename "$kit")" ) > "$sha"
+  meta="$STAGING_ROOT/${PREFIX}-${ts}.meta.json"
+  local kbytes; kbytes="$(stat -c %s "$kit")"
+  printf '{"prefix":"%s","ts":"%s","host":"%s","version":"%s","cipher":"%s","zstd_level":%s,"zstd_long":%s,"bytes":%s,"sha256":"%s"}\n' \
+    "$PREFIX" "$ts" "$(hostname)" "$VERSION" "$CIPHER" "$ZSTD_LEVEL" "$ZSTD_LONG" \
+    "$kbytes" "$(cut -d' ' -f1 "$sha")" > "$meta"
+  # the kit is now COMPLETE — from here on it must survive any failure (a failed upload must
+  # never let the EXIT trap delete the only copy that exists anywhere)
+  BK_UNCOMMITTED=()
+  log "kit: $(basename "$kit")  size=$(du -h "$kit" | cut -f1)  sha256=$(cut -d' ' -f1 "$sha")"
+
+  if [ $upload = 1 ]; then
+    # deletion/rollback check BEFORE this upload advances the anchor — daily, not monthly
+    check_remote_anchor "$REMOTE" "$STATE_DIR/expected"
+    [ -z "$REMOTE2" ] || check_remote_anchor "$REMOTE2" "$STATE_DIR/expected2"
+    log "uploading to $REMOTE (rclone verifies hash post-copy)…"
+    require_remote
+    rc copyto "$kit"  "$REMOTE/$(basename "$kit")"  || die "upload FAILED — kit kept locally: $kit"
+    rc copyto "$sha"  "$REMOTE/$(basename "$sha")"  || die "upload FAILED (sha256) — kit kept locally: $kit"
+    rc copyto "$meta" "$REMOTE/$(basename "$meta")" || die "upload FAILED (meta) — kit kept locally: $kit"
+    # confirm the kit is actually on the remote before we delete the only local copy
+    rc lsf "$REMOTE" --include "$(basename "$kit")" | grep -q . \
+      || die "upload verify FAILED — kit not found on remote; keeping local copy $kit"
+    # 3-2-1: mirror to the second remote (different vendor) BEFORE the local copy goes away
+    if [ -n "$REMOTE2" ]; then
+      log "mirroring to $REMOTE2…"
+      rc copyto "$kit"  "$REMOTE2/$(basename "$kit")"  || die "second-remote mirror FAILED — primary is uploaded; kit kept locally for retry: $kit"
+      rc copyto "$sha"  "$REMOTE2/$(basename "$sha")"  || die "second-remote mirror FAILED (sha256) — kit kept locally: $kit"
+      rc copyto "$meta" "$REMOTE2/$(basename "$meta")" || die "second-remote mirror FAILED (meta) — kit kept locally: $kit"
+      rc lsf "$REMOTE2" --include "$(basename "$kit")" | grep -q . \
+        || die "second-remote verify FAILED — kit not found on $REMOTE2; keeping local copy $kit"
+      prune_remote "$REMOTE2" "$(basename "$kit")"
+    fi
+    prune_remote "$REMOTE" "$(basename "$kit")"
+    # anti-rollback anchor: what the remote is EXPECTED to hold from now on. The drill alerts if
+    # the remote ever shows an older newest-kit or fewer kits than recorded here (deletion /
+    # rollback — a validly-signed OLD kit would otherwise pass every signature check).
+    local ecount
+    ecount="$(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null | wc -l | tr -d ' ' || true)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s %s\n' "$(basename "$kit")" "${ecount:-0}" > "$STATE_DIR/expected" 2>/dev/null \
+      || warn "could not record the anti-rollback anchor ($STATE_DIR/expected)"
+    if [ -n "$REMOTE2" ]; then
+      local ecount2
+      ecount2="$(rc lsf "$REMOTE2" --include "$KIT_GLOB" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      printf '%s %s\n' "$(basename "$kit")" "${ecount2:-0}" > "$STATE_DIR/expected2" 2>/dev/null || true
+    fi
+    rm -f "$kit" "$sha" "$meta"     # no local copies retained
+    log "uploaded + verified on remote${REMOTE2:+ + mirrored to $REMOTE2} + local kit pruned."
+  else
+    log "kept local (no upload): $kit"
+  fi
+  if [ "$keep_staging" = 1 ]; then
+    # same sweep-namespace escape as kept restores: .stage.* is reserved for crash debris
+    mv "$stage" "$STAGING_ROOT/kept-stage-$ts" 2>/dev/null || true
+    BK_STAGE=""
+    log "staging kept (--keep-staging): $STAGING_ROOT/kept-stage-$ts"
+  fi
+  # v1.9.0 appends bytes and seconds as fields 5 and 6. Appending (rather than reshaping) keeps
+  # every existing reader working -- they all index $1/$3/$4 -- and "-" marks a value this run
+  # could not measure, so a reader can tell "not recorded" from a real zero.
+  mkdir -p "$STATE_DIR"; printf '%s ok %s %s %s %s\n' "$(date -Is)" "$ts" "$(basename "$kit")" \
+    "${kbytes:--}" "$(( $(date +%s) - t0 ))" >> "$STATE_DIR/log"
+  write_status
+  log "backup complete."
+}
+
+# Compare a remote's CURRENT state against its recorded anchor ($2) and warn loudly on
+# deletion/rollback. Runs at every BACKUP (daily) — the anchor is rebaselined right after, so
+# this is the only window where an external deletion is still visible; a monthly-only check
+# would let the daily rebaseline launder it long before the provider's version history (Dropbox
+# Rewind, B2 lifecycle, S3 versioning) forgets. The REMOTE-ALERT marker is what backup-and-alert.sh
+# pages on. Kits are compared by timestamp, so an anchor written before 3.0.0 (a previous-name kit)
+# reads correctly against a newer kit of either name.
+check_remote_anchor(){
+  local remote="$1" anchor="$2"
+  [ -r "$anchor" ] || return 0
+  local exp_l exp_c listing cur_l cur_c out=""
+  exp_l="$(awk '{print $1}' "$anchor" || true)"
+  exp_c="$(awk '{print $2}' "$anchor" || true)"
+  listing="$(rc lsf "$remote" --include "$KIT_GLOB" 2>/dev/null | kit_sort || true)"
+  cur_l="$(printf '%s\n' "$listing" | tail -1)"
+  cur_c="$(printf '%s\n' "$listing" | grep -c . || true)"
+  if [ -n "$exp_l" ]; then
+    if [ -z "$cur_l" ]; then
+      out="$remote holds ZERO kits (expected $exp_c, newest $exp_l)"
+    elif kit_older "$cur_l" "$exp_l"; then
+      out="$remote newest kit $cur_l is OLDER than recorded $exp_l (ROLLBACK)"
+    fi
+  fi
+  case "$exp_c" in ''|*[^0-9]*) :;; *)
+    [ "${cur_c:-0}" -ge "$exp_c" ] || out="${out:+$out; }$remote holds ${cur_c:-0} kits, expected >= $exp_c (DELETION — recover them from the provider's version history before it expires)";;
+  esac
+  [ -z "$out" ] || warn "REMOTE-ALERT: $out"
+}
+
+# GFS retention on $1 (a remote). $2 = basename of the kit just uploaded — never prune it.
+# Keep set: newest $KEEP dailies + first kit of each of the last $KEEP_MONTHLY months + first
+# kit of each of the last $KEEP_YEARLY years. Everything else is dropped. Kits of both names are
+# one series, ordered by timestamp: a kit made before 3.0.0 counts as a daily, a monthly or a
+# yearly exactly as it did when it was written, and nothing is kept twice or dropped early.
+prune_remote(){
+  local remote="$1" cur="${2:-}" keep="$KEEP" f
+  case "${keep}${KEEP_MONTHLY}${KEEP_YEARLY}" in *[^0-9]*|'')
+    warn "TIMECRATE_KEEP/_MONTHLY/_YEARLY must be numbers (got $keep/$KEEP_MONTHLY/$KEEP_YEARLY) — skipping prune"; return 0;; esac
+  [ "$keep" -ge 1 ] || { warn "TIMECRATE_KEEP=$keep would prune EVERY kit — refusing"; return 0; }
+  local old listing
+  # A listing that failed may be a partial one, and nothing is decided from half a remote.
+  listing="$(rc lsf "$remote" --include "$KIT_GLOB" 2>/dev/null)" \
+    || { warn "retention[$remote]: could not list it — nothing pruned this run"; return 0; }
+  # input is sorted ascending, so the first kit seen per month/year IS the GFS keeper (mawk-safe)
+  old="$(printf '%s\n' "$listing" | grep . | kit_sort \
+    | awk -v daily="$keep" -v mon="$KEEP_MONTHLY" -v yr="$KEEP_YEARLY" '
+      { n++; kit[n]=$0; ts=$0; sub(/^[^-]*-/, "", ts)
+        mo=substr(ts,1,7); y=substr(ts,1,4)
+        if (mo != lastmo) { nm++; mfirst[nm]=$0; lastmo=mo }
+        if (y  != lasty)  { ny++; yfirst[ny]=$0; lasty=y }
+      }
+      END{
+        for (i=n;  i>n-daily && i>0; i--) keep_[kit[i]]=1
+        for (i=nm; i>nm-mon  && i>0; i--) keep_[mfirst[i]]=1
+        for (i=ny; i>ny-yr   && i>0; i--) keep_[yfirst[i]]=1
+        for (i=1; i<=n; i++) if (!(kit[i] in keep_)) print kit[i]
+      }')" || true
+  local dropped=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -n "$cur" ] && [ "$f" = "$cur" ]; then
+      warn "retention: just-uploaded kit $f fell into the prune window (clock rollback?) — keeping it"
+      continue
+    fi
+    local base="${f%.tar.zst.gpg}"
+    log "retention[$remote]: dropping $f"
+    rc delete "$remote/$f" 2>/dev/null || true
+    rc delete "$remote/$base.tar.zst.gpg.sha256" 2>/dev/null || true
+    rc delete "$remote/$base.meta.json" 2>/dev/null || true
+    dropped=$((dropped+1))
+  done <<< "$old"
+  [ "$dropped" = 0 ] || log "retention[$remote]: kept newest $keep dailies + $KEEP_MONTHLY monthly + $KEEP_YEARLY yearly firsts"
+}
+
+# A remote we cannot LIST is not an empty remote. Swallowing the error here printed nothing and
+# exited 0, which the GUI rendered as the friendly "No cloud backups yet" empty state — the
+# operator's only restore surface, quietly claiming there is nothing to restore.
+cmd_list(){
+  require_tools cloud
+  local long=0 a
+  for a in "$@"; do case "$a" in
+    --long) long=1;;
+    *) die "unknown list flag: $a";;
+  esac; done
+  local listing rcrc=0
+  # Bare `list` stays name-only on purpose: `restore` validates its argument against this output
+  # and the GUI builds its allow-list from it. Extra columns belong behind a flag.
+  if [ "$long" = 0 ]; then
+    rc_capture lsf "$REMOTE" --include "$KIT_GLOB" || rcrc=$?
+    [ "$rcrc" = 0 ] || die "cannot list $REMOTE (rclone exit $rcrc): $RC_ERR"
+    listing="$RC_OUT"
+    printf '%s' "$listing" | grep . | kit_sort || true
+    return
+  fi
+  # --separator is explicit because lsf's default is a comma and a comma is a legal Dropbox
+  # filename character; the field order is size;modtime;name from --format stp.
+  rc_capture lsf "$REMOTE" --include "$KIT_GLOB" --format stp --separator ';' || rcrc=$?
+  [ "$rcrc" = 0 ] || die "cannot list $REMOTE (rclone exit $rcrc): $RC_ERR"
+  listing="$RC_OUT"
+  # bytes TAB modtime TAB name, oldest first by the kit's timestamp. Raw bytes rather
+  # than a human size because the GUI parses this; pipe through `numfmt --to=iec --field=1` for
+  # a friendlier column.
+  # A line that does not split into three is passed through with its columns marked unknown
+  # rather than dropped: the GUI builds its restore list from this, and a kit missing from that
+  # list is a kit the operator is told they do not have.
+  # The sort key -- the name after its prefix -- rides in front as a fourth column and is cut off.
+  printf '%s' "$listing" | grep . | awk -F';' '{
+      if (NF >= 3) {
+        name = $3; for (i = 4; i <= NF; i++) name = name ";" $i   # a name containing the separator
+        size = ($1 ~ /^[0-9]+$/ ? $1 : "-"); mod = $2
+      } else { name = $0; size = "-"; mod = "-" }
+      key = name; sub(/^[^-]*-/, "", key)
+      printf "%s\t%s\t%s\t%s\n", key, size, mod, name
+    }' | LC_ALL=C sort -t"$(printf '\t')" -k1,1 | cut -f2- || true
+}
+
+cmd_restore(){
+  need_root restore
+  local ts="" to_root=0 local_file="" force=0 a
+  while [ $# -gt 0 ]; do case "$1" in
+    --to-root) to_root=1;;
+    --force) force=1;;
+    --local) [ $# -ge 2 ] || die "usage: $SELF restore --local <file.tar.zst.gpg>"; local_file="$2"; shift;;
+    --*) die "unknown restore flag: $1";;
+    *) ts="$1";;
+  esac; shift; done
+  local mode=""; if [ -z "$local_file" ]; then mode=cloud; fi
+  require_tools "$mode"
+  local work kit target
+  ensure_staging                # fresh recovery box: staging may not exist yet (restore is root)
+  work="$(mktemp -d "$STAGING_ROOT/.restore.XXXX")"; TC_TMP="$work"; trap 'rm -rf -- "$TC_TMP"' EXIT
+  if [ -n "$local_file" ]; then kit="$local_file"
+  else [ -n "$ts" ] || die "usage: $SELF restore <ts> | --local <file.tar.zst.gpg>"
+       # a full file name of either series, or a bare timestamp
+       local name; name="$(resolve_kit "$REMOTE" "$ts")"
+       kit="$work/$name"; log "fetching $name…"
+       rc copyto "$REMOTE/$name" "$kit"
+       rc copyto "$REMOTE/$name.sha256" "$kit.sha256" 2>/dev/null || true
+  fi
+  if [ -f "$kit.sha256" ]; then ( cd "$(dirname "$kit")" && sha256sum -c "$(basename "$kit").sha256" ) || die "checksum FAILED"
+  else warn "no .sha256 alongside kit — checksum verification SKIPPED"; fi
+  # anti-rollback: an OLD kit is validly signed, so the signature gate cannot catch an attacker
+  # (or a confused operator) restoring stale data. Compare against the recorded expected-latest.
+  if [ -r "$STATE_DIR/expected" ]; then
+    local exp kb; exp="$(awk '{print $1}' "$STATE_DIR/expected")"; kb="$(basename "$kit")"
+    # only canonical kit names carry a comparable timestamp — a hand-renamed --local file
+    # (kit.gpg etc.) must not false-trigger the guard and train the operator to reach for --force
+    case "$kb" in
+      "${PREFIX}-"*.tar.zst.gpg|"${LEGACY_PREFIX}-"*.tar.zst.gpg)
+        if [ -n "$exp" ] && kit_older "$kb" "$exp"; then
+          warn "ROLLBACK GUARD: $kb is OLDER than the newest recorded kit ($exp)"
+          [ "$force" = 1 ] || die "refusing to restore an older kit — intentional (point-in-time recovery)? rerun with --force"
+        fi;;
+      *) warn "non-canonical kit filename ($kb) — rollback guard skipped";;
+    esac
+  fi
+  if [ $to_root = 1 ]; then target=/; warn "extracting straight to / (bare-metal restore)"; else target="$work/extracted"; mkdir -p "$target"; fi
+  # decrypt to a temp FILE and verify the signature first — nothing touches $target (least of
+  # all /, as root) until the kit is proven authentic
+  local dec="$work/kit.tar.zst"
+  log "decrypt + signature verification (before ANY extraction)…"
+  decrypt_verified "$kit" "$dec"
+  log "decompress → extract to $target …"
+  local exargs=(--numeric-owner --acls --xattrs -xpf -)
+  [ "$to_root" = 1 ] && exargs+=(--exclude="$MANIFESTS" --exclude="$LEGACY_MANIFESTS")
+  zstd -dc --long=$ZSTD_LONG < "$dec" | tar "${exargs[@]}" -C "$target"
+  rm -f "$dec"
+  log "done. Manifests: $target/$MANIFESTS ($LEGACY_MANIFESTS in a kit made before 3.0.0; left out of a / restore)."
+  if [ $to_root != 1 ]; then
+    # rename OUT of the .restore.* namespace: the backup-time debris sweep rm -rf's aged
+    # .restore.* dirs, and a kept extraction under review must never match it
+    local kept; kept="$STAGING_ROOT/restored-$(date +%Y-%m-%d_%H-%M-%S)"
+    mv "$work" "$kept"; trap - EXIT; TC_TMP=""
+    log "inspect $kept/extracted ; RESTORE.md in /usr/share/doc/timecrate has the reinstall and package-replay steps."
+  fi
+}
+
+# One kit, end to end: checksum where there is one, signature, decrypt, archive listing.
+# ALWAYS call this inside a subshell — decrypt_verified dies on a bad signature, and a sweep that
+# stops at the first bad kit cannot tell you how many of the others are bad, which is the only
+# question worth asking once one has failed.
+verify_kit(){
+  local kit="$1"
+  if [ -f "$kit.sha256" ]; then
+    ( cd "$(dirname "$kit")" && sha256sum -c "$(basename "$kit").sha256" ) || die "sha256 FAILED"
+  else
+    warn "no $(basename "$kit").sha256 alongside the kit — checksum step SKIPPED"
+  fi
+  # temp next to the kit (disk-backed), not /tmp — a rescue box's tmpfs can't hold a full kit
+  local dec; dec="$(mktemp "$(dirname "$kit")/.timecrate-verify.XXXXXX" 2>/dev/null || mktemp)"
+  TC_TMP="$dec"; trap 'rm -f -- "$TC_TMP"' EXIT
+  decrypt_verified "$kit" "$dec"
+  zstd -dc --long=$ZSTD_LONG < "$dec" | tar -tf - >/dev/null \
+    || die "kit decrypted but does not decompress/list (truncated upload or corruption)"
+}
+
+cmd_pause(){
+  local arg="${1:-}"
+  if [ -z "$arg" ]; then
+    local u
+    if u="$(pause_active)"; then log "backups are PAUSED until $u (clear with: sudo $SELF pause off)"
+    else log "not paused — backups run on their schedule"; fi
+    return 0
+  fi
+  need_root pause
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if [ "$arg" = off ]; then
+    rm -f "$PAUSE_FILE" 2>/dev/null || true
+    write_status
+    log "pause cleared — the next scheduled backup runs normally"
+    return 0
+  fi
+  # The duration is MANDATORY. `pause` with no deadline is how a backup quietly stops existing:
+  # somebody pauses "for a moment" during a migration and nobody ever runs the un-pause.
+  local n unit secs
+  n="${arg%[mhd]}"; unit="${arg##"$n"}"
+  case "$n" in ''|*[^0-9]*) die "usage: sudo $SELF pause <duration|off> — e.g. 90m, 24h, 3d (max ${PAUSE_MAX_DAYS}d)";; esac
+  case "$unit" in
+    m) secs=$((n*60));; h) secs=$((n*3600));; d) secs=$((n*86400));;
+    *) die "unknown duration unit '${unit:-none}' — use m, h or d (e.g. 90m, 24h, 3d)";;
+  esac
+  [ "$secs" -gt 0 ] || die "a pause of zero is not a pause — use a real duration, or 'pause off'"
+  [ "$secs" -le $((PAUSE_MAX_DAYS*86400)) ] \
+    || die "refusing to pause for longer than ${PAUSE_MAX_DAYS} days — at that point disable the timer deliberately with '$SELF schedule backup off', where it is visible, instead of hiding it behind a pause that looks temporary"
+  local until; until="$(date -Is -d "@$(( $(date +%s) + secs ))")"
+  # Written atomically with an EXPLICIT mode. Left to the umask, a root `pause` under 0077 creates
+  # a 600 file: root-run backups read it and skip, while an unprivileged `status` cannot read it
+  # and reports no pause — backups silently not happening behind a healthy-looking screen, which
+  # is the precise trap this whole feature is built to avoid. The deadline is not a secret.
+  local tmpf; tmpf="$(mktemp "${PAUSE_FILE}.XXXXXX")" || die "cannot write to $STATE_DIR"
+  printf '%s\n' "$until" > "$tmpf"
+  chmod 0644 "$tmpf"
+  # A CHECKED prerequisite, and checked BEFORE the pause goes live. A 0644 file inside a 0700
+  # directory is still invisible to `status` — the same failure as the umask one, reached by a
+  # different route — so a chmod that quietly fails must not leave backups paused behind a
+  # healthy-looking screen. Roll back rather than publish a pause nobody can see.
+  chmod 0755 "$STATE_DIR" 2>/dev/null || true
+  local dmode; dmode="$(stat -c '%a' "$STATE_DIR" 2>/dev/null || echo 000)"
+  if [ "$(( 8#$dmode & 0005 ))" -ne 5 ]; then
+    rm -f "$tmpf"
+    die "refusing to pause: $STATE_DIR is mode $dmode and could not be made traversable, so an unprivileged '$SELF status' could not see the pause — backups would stop with nothing on screen saying so"
+  fi
+  mv -f "$tmpf" "$PAUSE_FILE"
+  # The warning comes BEFORE the status refresh. The pause is already in force at this point, and
+  # a failing status write must not swallow the one line that says so — `set -e` would otherwise
+  # exit non-zero having paused backups silently.
+  warn "backups PAUSED until $until — the recovery drill still runs, and status will keep saying PAUSED until it expires"
+  write_status || warn "the pause IS set, but refreshing $STATE_DIR/status.json failed — the window may show stale state until the next run"
+}
+
+cmd_verify(){
+  local pos="" remote=0 all=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --remote) remote=1;;
+    --all)    all=1; remote=1;;   # "every kit" can only mean the ones on the remote
+    --*)      die "unknown verify flag: $1";;
+    *)        [ -z "$pos" ] || die "usage: $SELF verify <file> | --remote [<ts>] | --all"; pos="$1";;
+  esac; shift; done
+
+  if [ "$remote" = 0 ]; then
+    [ -n "$pos" ] && [ -f "$pos" ] || die "usage: $SELF verify <file.tar.zst.gpg> | --remote [<ts>] | --all"
+    log "decrypt + signature verification + archive integrity (needs the secret key)…"
+    ( verify_kit "$pos" ) || die "VERIFY FAILED: $(basename "$pos")"
+    log "VERIFY OK: signature valid, archive decrypts and lists cleanly."
+    return 0
+  fi
+
+  [ "$all" = 0 ] || [ -z "$pos" ] || die "verify --all takes no kit name"
+  require_tools cloud
+  local names; names="$(cmd_list)" || die "cannot list $REMOTE — nothing to verify"
+  [ -n "$names" ] || die "no kits on $REMOTE to verify"
+  if [ "$all" = 0 ]; then
+    if [ -n "$pos" ]; then
+      # a kit name of either series, or a bare timestamp
+      local want="" n
+      while IFS= read -r n; do
+        [ "$(kit_ts "$n")" = "$(kit_ts "$pos")" ] && { want="$n"; break; }
+      done <<< "$names"
+      [ -n "$want" ] || die "no such kit on $REMOTE: $pos"
+      names="$want"
+    else
+      names="$(printf '%s\n' "$names" | tail -1)"   # list is sorted, so the last is the newest
+    fi
+  fi
+
+  # verify is deliberately unprivileged and staging is root-owned, so it works in the caller's own
+  # cache rather than needing a shared, user-writable staging area — that shared area is exactly
+  # what made root-writes-through-a-user-path unavoidable.
+  #
+  # Decide the working directory BEFORE creating anything. The first cut ran `mkdir -p
+  # "$STAGING_ROOT"` unconditionally, which on a box where the root-owned staging directory did
+  # not exist yet failed with "mkdir: Permission denied" and killed verify before it could reach
+  # this fallback — breaking the exact case the fallback is for. My own live check missed it
+  # because I had already created the directory with sudo while testing.
+  #
+  # Disk-backed, not /tmp: a kit does not fit in a small tmpfs.
+  local workroot=""
+  if [ -d "$STAGING_ROOT" ] && [ -w "$STAGING_ROOT" ]; then
+    workroot="$STAGING_ROOT"
+  else
+    workroot="${XDG_CACHE_HOME:-$HOME/.cache}/timecrate"
+    mkdir -p "$workroot" || die "staging ($STAGING_ROOT) is not usable as $(id -un) and $workroot could not be created either"
+  fi
+  local work; work="$(mktemp -d "$workroot/.verify.XXXX")"; TC_TMP="$work"
+  trap 'rm -rf -- "$TC_TMP"' EXIT
+  local total=0 good=0 bad="" f
+  while read -r f; do
+    [ -n "$f" ] || continue
+    total=$((total+1))
+    log "[$total] fetching $f…"
+    if ! rc copyto "$REMOTE/$f" "$work/$f" 2>/dev/null; then
+      warn "$f: could not be fetched"; bad="$bad $f(fetch)"; continue
+    fi
+    rc copyto "$REMOTE/$f.sha256" "$work/$f.sha256" 2>/dev/null || true
+    if ( verify_kit "$work/$f" ); then good=$((good+1)); else bad="$bad $f"; fi
+    rm -f "$work/$f" "$work/$f.sha256"      # one kit on disk at a time, not the whole remote
+  done <<< "$names"
+
+  # The count is the point: "12 of 15" is actionable, "it failed" is not.
+  [ -z "$bad" ] || die "VERIFY FAILED — $good/$total verified; FAILED:$bad"
+  log "VERIFY OK: $good/$total kit(s) on $REMOTE decrypt, authenticate and list cleanly."
+}
+
+cmd_demo(){
+  require_tools
+  local t; t="$(mktemp -d)"; TC_TMP="$t"; trap 'rm -rf -- "$TC_TMP"' EXIT
+  local Ge="$t/gpg-enc" Gd="$t/gpg-dec"; mkdir -p "$Ge" "$Gd"; chmod 700 "$Ge" "$Gd"
+  GNUPGHOME="$Ge" gpg --batch --gen-key >/dev/null 2>&1 <<'KEYSPEC'
+%no-protection
+Key-Type: RSA
+Key-Length: 3072
+Key-Usage: cert
+Subkey-Type: RSA
+Subkey-Length: 3072
+Subkey-Usage: encrypt
+Name-Real: timecrate-demo
+Expire-Date: 0
+%commit
+KEYSPEC
+  local fpr; fpr="$(GNUPGHOME="$Ge" gpg --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+  # standalone SIGNING keypair (the v1.3.0 authenticity chain)
+  GNUPGHOME="$Ge" gpg --batch --gen-key >/dev/null 2>&1 <<'KEYSPEC'
+%no-protection
+Key-Type: RSA
+Key-Length: 3072
+Key-Usage: sign
+Name-Real: timecrate-demo-sign
+Expire-Date: 0
+%commit
+KEYSPEC
+  local sfpr; sfpr="$(GNUPGHOME="$Ge" gpg --list-keys --with-colons timecrate-demo-sign | awk -F: '/^fpr/{print $10; exit}')"
+  # fixture with the fidelity-sensitive bits
+  local fx="$t/fx"; mkdir -p "$fx/sub"; echo hello > "$fx/a"; ln -s a "$fx/link"; ln "$fx/a" "$fx/hard"
+  truncate -s 2M "$fx/sparse"; chmod 4711 "$fx/sub"; setfacl -m u:root:r "$fx/a" 2>/dev/null || true
+  tar --numeric-owner --acls --xattrs --sparse -p -cf - -C "$t" fx \
+    | zstd -T0 --long=$ZSTD_LONG -19 \
+    | GNUPGHOME="$Ge" gpg --batch --yes --trust-model always --cipher-algo AES256 --compress-algo none \
+        --sign -u "$sfpr" -e -r "$fpr" -o "$t/kit.gpg"
+  # RECOVERY SIMULATION: escrow decrypt-secret + signing-PUBLIC, import into a SEPARATE fresh
+  # keyring, decrypt+verify THERE (what a wiped-OS restore does — this shape caught the ECC
+  # export/import failure, and now also catches a broken authenticity chain).
+  GNUPGHOME="$Ge" gpg --batch --armor --export-secret-keys "$fpr" > "$t/escrow.asc"
+  GNUPGHOME="$Ge" gpg --batch --armor --export "$sfpr" > "$t/signing-pub.asc"
+  GNUPGHOME="$Gd" gpg --batch --import "$t/escrow.asc" 2>/dev/null
+  GNUPGHOME="$Gd" gpg --batch --import "$t/signing-pub.asc" 2>/dev/null
+  local outd="$t/out"; mkdir -p "$outd"
+  GNUPGHOME="$Gd" gpg --batch --no-tty --status-file "$t/st" -o "$t/kit.tar.zst" -d "$t/kit.gpg" 2>/dev/null
+  local ok=1
+  grep -q "^\[GNUPG:\] VALIDSIG $sfpr" "$t/st" || { echo "FAIL: signed kit did not yield VALIDSIG from the signing key in the recovery keyring"; ok=0; }
+  zstd -dc --long=$ZSTD_LONG < "$t/kit.tar.zst" | tar --numeric-owner --acls --xattrs -xpf - -C "$outd"
+  [ -s "$outd/fx/a" ] || { echo "FAIL: recovery keyring produced NOTHING (decrypt broken!)"; ok=0; }
+  diff -r "$fx" "$outd/fx" >/dev/null 2>&1 || { echo "FAIL: content diff"; ok=0; }
+  [ -L "$outd/fx/link" ] || { echo "FAIL: symlink not preserved"; ok=0; }
+  [ "$(stat -c %i "$outd/fx/a" 2>/dev/null)" = "$(stat -c %i "$outd/fx/hard" 2>/dev/null)" ] || { echo "FAIL: hardlink not preserved"; ok=0; }
+  [ "$(stat -c %a "$outd/fx/sub" 2>/dev/null)" = 4711 ] || { echo "FAIL: setuid bit not preserved"; ok=0; }
+  # FORGERY: a kit encrypted to the right recipient but UNSIGNED (what a Dropbox-write attacker
+  # can produce — they never have the signing secret) must yield no VALIDSIG
+  echo forged > "$t/forge"; tar -cf - -C "$t" forge | zstd -T0 --long=$ZSTD_LONG \
+    | GNUPGHOME="$Ge" gpg --batch --yes --trust-model always --cipher-algo AES256 --compress-algo none \
+        -e -r "$fpr" -o "$t/forged.gpg"
+  GNUPGHOME="$Gd" gpg --batch --no-tty --yes --status-file "$t/st2" -o /dev/null -d "$t/forged.gpg" 2>/dev/null
+  ! grep -q '^\[GNUPG:\] VALIDSIG ' "$t/st2" || { echo "FAIL: forged (unsigned) kit produced a VALIDSIG?!"; ok=0; }
+  # HARDEN SURVIVAL: delete the ENCRYPTION secret (what harden does), then sign+encrypt again —
+  # the standalone signing key must still work (a subkey would have died here)
+  GNUPGHOME="$Ge" gpg --batch --yes --delete-secret-keys "$fpr" 2>/dev/null
+  if ! printf x | GNUPGHOME="$Ge" gpg --batch --yes --trust-model always --cipher-algo AES256 --compress-algo none \
+        --sign -u "$sfpr" -e -r "$fpr" -o /dev/null 2>/dev/null; then
+    echo "FAIL: signing broke after harden-style deletion of the encryption secret"; ok=0
+  fi
+  [ $ok = 1 ] && { log "DEMO PASS — signed round-trip via escrow keyring (VALIDSIG), forged-unsigned kit rejected, signing survives harden, fidelity preserved (content/symlink/hardlink/setuid)."; return 0; }
+  die "DEMO FAILED"
+}
+
+cmd_status(){
+  local sf="$STATE_DIR/status.json"
+  # every substitution here tolerates failure: status must render whatever it CAN show
+  # (Dropbox down, no systemd, no drill yet), not die at the first unreachable source
+  # "" = could not ask (rclone missing / remote unreachable), "0" = asked and the remote is EMPTY.
+  # Collapsing those two into 0 is how a broken remote path rendered as a green "0 KITS".
+  local kits="" cbytes="" listing rcrc=0
+  if have rclone; then
+    # ONE listing serves both the count and the total. --format sp is size;name, so an empty
+    # remote still yields a measured 0 bytes while an unreadable one stays "" -- the same
+    # unknown-vs-zero rule the kit count already follows.
+    listing="$(rc lsf "$REMOTE" --include "$KIT_GLOB" \
+                 --format sp --separator ';' 2>/dev/null)" || rcrc=$?
+    if [ "$rcrc" = 0 ]; then
+      kits="$(printf '%s' "$listing" | grep -c . || true)"
+      # Total or nothing. A row whose size column is missing is not a row of zero bytes, and
+      # summing only the rows that parsed would publish a PARTIAL total -- or a measured 0
+      # against a remote full of kits -- as though it were complete. An empty remote still
+      # totals a real 0, because rows and parsed rows are both none.
+      # %.0f rather than %d: the sum is a double either way, and this owes nothing to how wide
+      # a given awk's integer conversion happens to be.
+      cbytes="$(printf '%s' "$listing" | awk -F';' '
+          NF { rows++; if ($1 ~ /^[0-9]+$/) { parsed++; s += $1 } }
+          END { if (rows == parsed) printf "%.0f", s }')"
+    fi
+  fi
+  # Quota belongs to the whole remote, not the backup folder, so `about` gets the bare remote
+  # name. Backends that cannot answer (and an unreachable one) leave the quota fields "".
+  local about=""
+  if have rclone && [ -n "$REMOTE" ]; then
+    about="$(rc about "${REMOTE%%:*}:" --json 2>/dev/null)" || about=""
+  fi
+  local nextdrill; nextdrill="$(systemctl list-timers timecrate-drill.timer --no-pager 2>/dev/null | sed -n 2p | awk '{print $1,$2,$3}' || true)"
+  local drillres; drillres="$(journalctl -u timecrate-drill.service -n 20 --no-pager 2>/dev/null | grep -oE 'RECOVERY DRILL (PASSED|FAILED)' | tail -1 || true)"
+  KITS="$kits" CBYTES="$cbytes" ABOUT="$about" NEXTDRILL="$nextdrill" DRILLRES="$drillres" \
+  PAUSED="$(pause_active || true)" \
+  python3 - "$sf" "${1:-}" <<'PY'
+import sys,json,os
+sf=sys.argv[1]; mode=sys.argv[2] if len(sys.argv)>2 else ""
+d={}
+try: d=json.load(open(sf))
+except Exception: pass
+d["cloud_kits"]=os.environ.get("KITS","")
+d["cloud_bytes"]=os.environ.get("CBYTES","")
+# live, never from the stored file: a lapsed pause must stop being one the moment it lapses
+d["paused_until"]=os.environ.get("PAUSED","")
+d["drill_next"]=os.environ.get("NEXTDRILL","")
+# status.json's drill_last (written by the drill itself) wins; journalctl is the fallback
+d["drill_last"]=d.get("drill_last") or os.environ.get("DRILLRES","")
+# a backend that does not implement `about` is not a backend at quota zero
+used=total=""
+try:
+    a=json.loads(os.environ.get("ABOUT","") or "{}")
+    if isinstance(a.get("used"), int): used=str(a["used"])
+    if isinstance(a.get("total"), int): total=str(a["total"])
+except Exception: pass
+d["remote_quota_used"]=used; d["remote_quota_total"]=total
+if mode=="--json":
+    print(json.dumps(d)); sys.exit()
+def hb(v):
+    if v in ("", None): return "unknown"
+    n=float(v)
+    for u in ("B","KB","MB","GB","TB"):
+        if n < 1024 or u == "TB": return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n/=1024
+def row(k,v): print(f"  {k:<16} {v}")
+print("Timecrate status")
+if d.get("paused_until"): row("BACKUPS", "PAUSED until " + d["paused_until"])
+row("remote", d.get("remote","")); row("cloud kits", d.get("cloud_kits","")); row("last backup", d.get("last_backup","(none yet)"))
+row("cloud size", hb(d.get("cloud_bytes","")))
+row("remote quota", (hb(d.get("remote_quota_used","")) + " of " + hb(d.get("remote_quota_total","")))
+                    if d.get("remote_quota_total") else "not reported by this backend")
+row("local kits", d.get("local_kits","?"))
+row("cipher", d.get("cipher","")); row("key", d.get("keytype","")+"  "+d.get("key_fpr","")[:16])
+row("escrow", "confirmed" if d.get("escrow_confirmed") else "NOT confirmed")
+row("drill last", d.get("drill_last","(never)")); row("drill next", d.get("drill_next",""))
+PY
+}
+
+# Timer control, so "when does this run" is answerable and changeable without hand-editing units.
+# The GUI drives this through the same pkexec path as backup/restore: one privileged binary, one
+# allow-list. Teaching the front-end to run systemctl directly would have doubled both.
+TIMER_UNITS="backup drill"
+cmd_schedule(){
+  local which="" action="" at="" a
+  while [ $# -gt 0 ]; do case "$1" in
+    --at) [ $# -ge 2 ] || die "usage: $SELF schedule <backup|drill> on --at <OnCalendar>"; at="$2"; shift;;
+    --*) die "unknown schedule flag: $1";;
+    backup|drill) which="$1";;
+    on|off) action="$1";;
+    *) die "unknown schedule argument: $1";;
+  esac; shift; done
+
+  # Validate the operator's input before anything about this machine: a malformed OnCalendar does
+  # not error at enable time, the timer simply never fires again — which for a backup is
+  # indistinguishable from working right up until the day you need a restore.
+  if [ -n "$at" ] && have systemd-analyze; then
+    systemd-analyze calendar "$at" >/dev/null 2>&1 \
+      || die "not a valid OnCalendar expression: '$at' (try: daily, monthly, '*-*-* 03:00:00')"
+  fi
+
+  if [ -z "$which" ]; then
+    [ -z "$action" ] || die "usage: $SELF schedule <backup|drill> <on|off> [--at <OnCalendar>]"
+    local u state next cal
+    printf 'Scheduled runs\n'
+    for u in $TIMER_UNITS; do
+      # `is-enabled` on an uninstalled unit PRINTS "not-found" and also exits non-zero, so a
+      # bare `|| echo disabled` yields two lines and breaks this into an unparsable mess — for
+      # the operator reading it and for the front-end, which reads one unit per line.
+      state="$(systemctl is-enabled "timecrate-$u.timer" 2>/dev/null | head -1 || true)"
+      case "$state" in ''|not-found) state=disabled;; esac
+      # systemd renders this as "{ OnCalendar=<expr> ; next_elapse=<when> }" — keep the
+      # expression, drop its next_elapse, which is already the `next:` column
+      cal="$(systemctl show -p TimersCalendar --value "timecrate-$u.timer" 2>/dev/null | grep -oE '\{ OnCalendar=[^}]*' | sed 's/{ OnCalendar=//; s/ *; *next_elapse=.*//; s/ *$//' | tr '\n' ' ' || true)"
+      cal="${cal% }"
+      next="$(systemctl list-timers "timecrate-$u.timer" --no-pager 2>/dev/null | sed -n 2p | awk '{print $1,$2,$3}' | head -1 || true)"
+      printf '  %-8s %-9s %-28s next: %s\n' "$u" "$state" "${cal:-(no timer)}" "${next:-—}"
+    done
+    printf '\nChange with:  sudo %s schedule backup on --at "*-*-* 03:00:00"\n' "$SELF"
+    return 0
+  fi
+
+  [ -n "$action" ] || die "usage: $SELF schedule $which <on|off> [--at <OnCalendar>]"
+  need_root schedule
+  have systemctl || die "systemctl not available — this box does not schedule through systemd"
+  local timer="timecrate-$which.timer"
+  systemctl cat "$timer" >/dev/null 2>&1 || die "$timer is not installed"
+
+  if [ -n "$at" ]; then
+    local d="/etc/systemd/system/$timer.d"
+    mkdir -p "$d"
+    printf '# written by `%s schedule` — edit there, not here\n[Timer]\nOnCalendar=\nOnCalendar=%s\n' \
+      "$SELF" "$at" > "$d/override.conf"
+    systemctl daemon-reload
+    log "schedule: $which now runs on '$at'"
+  fi
+
+  if [ "$action" = on ]; then
+    systemctl enable --now "$timer" >/dev/null 2>&1 || die "could not enable $timer"
+    log "schedule: $which ENABLED ($(systemctl list-timers "$timer" --no-pager 2>/dev/null | sed -n 2p | awk '{print $1,$2,$3}'))"
+  else
+    systemctl disable --now "$timer" >/dev/null 2>&1 || die "could not disable $timer"
+    warn "schedule: $which DISABLED — nothing will run it now"
+  fi
+}
+
+# Where every setting actually came from. The one command to run when the tool and the operator
+# disagree about what is configured — the split-brain this replaced was invisible without it.
+cmd_config(){
+  local f
+  echo "Config sources — later overrides earlier; the environment overrides all:"
+  for f in "$SYSTEM_CONF" "$SECRET_ENV" "$USER_CONF"; do
+    if [ -r "$f" ]; then
+      printf '  loaded       %s%s\n' "$f" "$([ "$f" = "$SECRET_ENV" ] && echo '   (root-only; values not shown)')"
+    elif [ -e "$f" ]; then
+      # "absent" for a root-only file you are simply not allowed to read is the same kind of lie
+      # this command exists to catch: it reads as "nothing is configured there". But only
+      # SECRET_ENV is *meant* to be unreadable — saying "normal, the units load it anyway" about
+      # a mode-mangled system or user config would be the same lie with the opposite sign.
+      if [ "$f" = "$SECRET_ENV" ]; then
+        printf '  UNREADABLE   %s   (exists, but not readable as %s — normal for the root-only secrets file; the units and root DO load it)\n' "$f" "$(id -un)"
+      else
+        printf '  UNREADABLE   %s   (exists, but not readable as %s — this file is meant to be readable; check its permissions)\n' "$f" "$(id -un)"
+      fi
+    else
+      printf '  absent       %s\n' "$f"
+    fi
+  done
+  echo
+  echo "Effective settings:"
+  local k
+  for k in TC_USER REMOTE REMOTE2 INCLUDE_FILE EXCLUDE_FILE CONF_DIR STATE_DIR STAGING_ROOT \
+           RCLONE_CONF KEEP KEEP_MONTHLY KEEP_YEARLY MIN_MB MAX_MB ZSTD_LEVEL ZSTD_LONG \
+           GIT_WATCH ESCROW_SSH ESCROW_KEY_CMD ALERT_CMD TIMESHIFT_GUARD LOCKFILE; do
+    # TC_USER carries its provenance, because it is the one setting that is silently *derived*
+    # when unset: every other line here is either configured or a documented default, while this
+    # one can be answered by the environment in three different ways that look identical once
+    # resolved. "root" alone reads as a deliberate choice; "root (NOT pinned…)" does not.
+    if [ "$k" = TC_USER ]; then
+      printf '  %-14s %s   (%s)\n' "$k" "$TC_USER" "$TC_USER_FROM"
+    else
+      printf '  %-14s %s\n' "$k" "${!k}"
+    fi
+  done
+  echo
+  echo "Any of these can be set as TIMECRATE_<NAME> in $SYSTEM_CONF."
+  [ -r "$INCLUDE_FILE" ] || warn "include file is NOT readable: $INCLUDE_FILE — backup will refuse to run"
+  [ -r "$EXCLUDE_FILE" ] || warn "exclude file is NOT readable: $EXCLUDE_FILE — backup will refuse to run"
+}
+
+cmd_help(){ cat <<EOF
+timecrate $VERSION — lean encrypted off-site disaster-recovery backup
+
+       $SELF init [--new-identity]   generate a keypair for a NEW machine (run once; NOT sudo --
+                             the keyring belongs to the configured user, not root. Refuses when
+                             the remote already holds backups, which need import-key instead)
+  sudo $SELF harden          delete on-box secret key (encrypt-only, after escrow)
+  sudo $SELF backup [--dry-run|--no-upload|--keep-staging]
+                             build → compress (zstd -T0 --long) → encrypt (gpg AES-256) → remote
+       $SELF list [--long]   list kits on the remote (--long adds bytes and modtime as
+                             tab-separated columns; pipe through 'numfmt --to=iec --field=1')
+  sudo $SELF restore <ts> [--to-root] [--force] | restore --local <file>
+                             fetch → decrypt → VERIFY SIGNATURE → extract (staging by default;
+                             --to-root for bare metal;
+                             --force = deliberately restore a kit OLDER than the newest recorded)
+       $SELF verify <file> | --remote [<ts>] | --all
+                             decrypt + signature + integrity check. <file> is a local kit;
+                             --remote fetches one from the remote (newest unless <ts> is given)
+                             and --all does every kit there, reporting how many of how many
+       $SELF status [--json] show live status (used by the GUI; no root needed)
+       $SELF config          show every effective setting and which file it came from
+       $SELF schedule        show the timers;  sudo $SELF schedule backup on --at daily
+       $SELF pause [<dur>|off]  skip scheduled backups for a while (90m, 24h, 3d; max 30d).
+                             Always expires, only stops backup — the drill keeps running
+       $SELF demo            self-test the crypto+fidelity pipeline (no root, throwaway keyring)
+       $SELF break-glass <file> [target]   raw tool-independent recovery (BREAK-GLASS.md, /usr/share/doc/timecrate)
+       $SELF escrow-doc [outfile]  write a printable recovery sheet (+QR) of the secret key
+       $SELF recovery-drill [key] [ts]   PROVE an escrowed key alone decrypts a real backup
+  sudo $SELF escrow-confirm       mark the key as safely escrowed (clears the backup warning)
+
+Remote — where the backups go (none of these need root):
+       $SELF remote status [--json]   path, backend, account, token expiry, reachability
+       $SELF remote connect [--provider dropbox] [--reauthorize]
+                             run the provider's authorisation and store it in rclone's config
+       $SELF remote test     prove it lists AND writes; names the reason when it does not
+       $SELF remote browse [<remote:path>] [--json]   one level of folders, for picking one
+       $SELF remote mkdir <remote:path>
+       $SELF remote set-path <remote:path> [--yes] [--dry-run]
+                             shows the backup count at both ends first
+       $SELF remote disconnect [--remove-rclone-remote] [--yes]
+
+       $SELF history [--json] [-n N]   what this machine has actually been doing
+       $SELF alerts [--json]   would a failure reach anyone?
+  sudo $SELF alerts test       send a real one down the same path and find out now
+       $SELF paths <include|exclude> list
+  sudo $SELF paths <include|exclude> add|remove <path>
+                             what goes into a kit. These files are root-owned, so changing them
+                             needs root; listing them does not
+       $SELF coverage [--root PATH]... [--json] [--no-size] [--warn-mb N]
+                             what is backed up, what is pruned, and -- the part nothing else
+                             answers -- what NOTHING covers. The include list is an allowlist, so
+                             anything unnamed is absent from every kit and no other command says so
+
+Keys — recovering a machine starts here (none of these need root):
+       $SELF keys [--json]   which keys exist, whether their secret halves are on this box,
+                             and whether the escrow was ever confirmed (and for which key)
+       $SELF import-key <file|-> [--signing-pub <file>] [--replace] [--yes] [--dry-run]
+                             import an escrowed secret key onto a rebuilt machine. Validated in a
+                             throwaway keyring first; --replace keeps the old key so old kits stay
+                             readable
+       $SELF verify-key [--deep]   can THIS box read the newest backup? (header check by default;
+                             --deep decrypts and authenticates the whole kit)
+       $SELF export-key [--out <file>]   re-escrow the secret key; refuses to write it anywhere
+                             that would end up inside a backup
+
+Configuration, strongest source first:
+  environment                               TIMECRATE_REMOTE=… $SELF list
+  \$HOME/.config/timecrate/timecrate.conf   per-user
+  /etc/timecrate.env                        root-only secrets (0600)
+  /etc/timecrate/timecrate.conf             system-wide
+Run '$SELF config' to see what is actually in effect and where it came from.
+Kits written before 3.0.0 are named timemachine-<ts>; they are listed, verified, restored and
+pruned together with timecrate-<ts> kits, as one series.
+EOF
+}
+
+cmd_break_glass(){
+  local kit="" target="" a
+  for a in "$@"; do case "$a" in
+    --*) die "unknown break-glass flag: $a";;
+    *) if [ -z "$kit" ]; then kit="$a"; else target="$a"; fi;;
+  esac; done
+  target="${target:-./restore}"
+  [ -n "$kit" ] && [ -f "$kit" ] || die "usage: $SELF break-glass <file.tar.zst.gpg> [target-dir]"
+  mkdir -p "$target"
+  # Extracting a kit with -C / overwrites the running system. That is `restore --to-root`'s job,
+  # and it is gated there -- signature verified before a byte is written, and the front-end makes
+  # you type the word. Reaching the identical outcome by passing / as a directory would route
+  # around that gate completely, and the window hands this argument straight from a folder
+  # chooser. The guard lives HERE rather than in the front-end because the front-end is not a
+  # security boundary: the engine is what actually runs tar as root, and every caller reaches it.
+  #
+  # Resolved with `cd`+`pwd -P` after mkdir and immediately before use, so a symlink swapped in
+  # between choosing a directory and extracting into it resolves here too. (A swap in the window
+  # between this check and tar is still theoretically possible; closing that needs an open fd, and
+  # anyone able to win that race already holds the pkexec rights this runs under.)
+  local real; real="$(cd "$target" 2>/dev/null && pwd -P || true)"
+  [ -n "$real" ] || die "cannot resolve the target directory: $target"
+  [ "$real" != "/" ] || die "refusing to extract over / — that is 'restore --to-root', which verifies and asks for confirmation first. Break-glass extracts into a directory for inspection (see BREAK-GLASS.md)."
+  target="$real"
+  cat <<EOF
+Tool-independent recovery (raw gpg + zstd + tar — no timecrate required):
+  gpg --status-file st.txt -o kit.tar.zst -d '$kit'
+  grep VALIDSIG st.txt        # fpr MUST match the signing key on the escrow sheet — do NOT
+                              # extract without it (unsigned = forged or pre-v1.3.0)
+  zstd -dc --long=$ZSTD_LONG < kit.tar.zst | sudo tar --numeric-owner --acls --xattrs -xpf - -C '$target'
+Running the same steps now (verify-before-extract) →
+EOF
+  # temp INSIDE the target dir (disk-backed) — a 2 GB rescue box's /tmp tmpfs can't hold a kit
+  local dec; dec="$(mktemp "$target/.timecrate-dec.XXXXXX")"; TC_TMP="$dec"; trap 'rm -f -- "$TC_TMP"' EXIT
+  # Report, do not gate: this command exists to be the path that still works when everything else
+  # does not, and telling someone "refused" with no route is not that. But it will not extract
+  # what it cannot authenticate either -- the printed steps above are the route, and running them
+  # by hand is a decision a person makes rather than one this tool makes for them.
+  if decrypt_verified "$kit" "$dec" report; then
+    zstd -dc --long=$ZSTD_LONG < "$dec" | sudo tar --numeric-owner --acls --xattrs -xpf - -C "$target"
+    log "extracted to $target — see $target/$MANIFESTS ($LEGACY_MANIFESTS in a kit made before 3.0.0) for package/dconf replay."
+  else
+    warn "this archive carries NO verifiable signature."
+    warn "Refusing to extract it for you: an unsigned archive is either older than v1.3.0 (2026-07-23) or has been tampered with, and nothing here can tell those apart."
+    die "If you know which it is, run the three commands printed above by hand — they need no part of this tool."
+  fi
+}
+
+cmd_escrow_doc(){
+  local out="${1:-$CONF_DIR/timecrate-ESCROW-DOC.txt}"
+  [ -f "$SECRET_ESCROW" ] || die "no secret key at $SECRET_ESCROW — run '$SELF init' first (or it was hardened away)"
+  # the sheet's recovery steps reference the signing key — a sheet without it would instruct
+  # a verification that cannot be performed
+  [ -f "$SIGNING_PUB" ] || die "signing public key missing ($SIGNING_PUB) — run '$SELF init' first (v1.3.0 sheets must carry it)"
+  # the sheet CONTAINS the secret key — writing it anywhere the backup includes would ship the
+  # key inside the very kit it decrypts
+  local rp inc
+  rp="$(realpath -m -- "$out" 2>/dev/null || echo "$out")"
+  if [ -r "$INCLUDE_FILE" ]; then
+    while read -r inc; do
+      case "$rp" in
+        "/$inc"/*|"/$inc") die "refusing to write the escrow sheet to $rp — that path is INSIDE the backup include set (/$inc)";;
+      esac
+    done < <(build_include)
+  fi
+  local fpr; fpr="$(head -1 "$RECIPIENTS_FILE")"
+  umask 077
+  {
+    echo "============ TIMECRATE — KEY ESCROW  (PRINT THIS, STORE OFFLINE) ============"
+    echo "Host: $(hostname)    Generated: $(date -Is)    Fingerprint: $fpr"
+    echo
+    echo "This page decrypts EVERY Timecrate backup. It is NOT stored in the backups."
+    echo "Without it, recovery after an OS wipe is IMPOSSIBLE. Keep it in a safe / password"
+    echo "manager, separate from the cloud account that holds the backups."
+    echo
+    echo "--- RECOVER on any machine with gpg + zstd + tar ---"
+    echo "  gpg --import <the secret key below>          # decryption"
+    echo "  gpg --import <the signing PUBLIC key below>  # authentication"
+    echo "  sha256sum -c timecrate-<ts>.tar.zst.gpg.sha256"
+    echo "  gpg --status-file st.txt -o kit.tar.zst -d timecrate-<ts>.tar.zst.gpg"
+    echo "  grep VALIDSIG st.txt   # MUST list the signing fingerprint printed below —"
+    echo "                         # NO VALIDSIG means the kit is forged/tampered: STOP."
+    echo "  sudo mkdir -p /restore"
+    echo "  zstd -dc --long=$ZSTD_LONG < kit.tar.zst \\"
+    echo "    | sudo tar --numeric-owner --acls --xattrs -xpf - -C /restore"
+    echo "  (kits made before 3.0.0 are named timemachine-<ts>; the steps are the same)"
+    echo "  (full steps: RESTORE.md and BREAK-GLASS.md, https://github.com/spencercnorton/timecrate)"
+    echo
+    echo "--- GPG SECRET KEY (ASCII-armored, decryption) ---"
+    cat "$SECRET_ESCROW"
+    if [ -f "$SIGNING_PUB" ]; then
+      echo
+      echo "--- SIGNING PUBLIC KEY (authentication; fpr: $(cat "$SIGNING_FILE" 2>/dev/null || echo '?')) ---"
+      cat "$SIGNING_PUB"
+    fi
+  } > "$out"
+  chmod 600 "$out"
+  log "escrow document: $out"
+  if have qrencode; then
+    if qrencode -8 -o "${out%.txt}.qr.png" < "$SECRET_ESCROW" 2>/dev/null; then
+      log "QR of the key: ${out%.txt}.qr.png (scan to recover the key with no digital copy)"
+    else warn "key too large for a single QR — the printed text is authoritative"; fi
+  else warn "install qrencode (apt install qrencode) for a scannable paper QR of the key"; fi
+  echo; echo ">> PRINT $out and store it offline. This is your last-resort recovery key. <<"
+}
+
+cmd_recovery_drill(){
+  # PROVE an escrowed key alone can decrypt a real backup on the remote, in a throwaway keyring.
+  local keyfile="${1:-$SECRET_ESCROW}" ts="${2:-}"
+  [ -f "$keyfile" ] || die "usage: $SELF recovery-drill [<escrow-key.asc>] [<ts>]  (default key: $SECRET_ESCROW)"
+  require_tools cloud
+  local t; t="$(mktemp -d)"; TC_TMP="$t"; trap 'rm -rf -- "$TC_TMP"' EXIT
+  export GNUPGHOME="$t/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+  log "importing ONLY the escrowed key into a throwaway keyring (simulating a wiped OS)…"
+  gpg --batch --import "$keyfile" 2>/dev/null || die "could not import key from '$keyfile'"
+  # the signing PUBLIC key rides along: the drill proves the escrow can AUTHENTICATE, not just decrypt
+  if ! { [ -f "$SIGNING_PUB" ] && gpg --batch --import "$SIGNING_PUB" 2>/dev/null; }; then
+    warn "signing public key unavailable ($SIGNING_PUB) — this drill cannot verify the signature"
+  fi
+  gpgconf --kill gpg-agent 2>/dev/null || true   # fresh agent re-reads the just-imported ECC key (avoids in-process 'Bad secret key')
+  # the newest kit of either series, or the one named (a file name or a bare timestamp)
+  local name
+  if [ -n "$ts" ]; then name="$(resolve_kit "$REMOTE" "$ts")"
+  else name="$(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null | kit_sort | tail -1)"; fi
+  if [ -z "$name" ]; then
+    # total wipe is the WORST deletion case — diagnose it, never say "run a backup first"
+    # (a fresh backup would rebaseline the anchor and destroy the evidence while the provider's
+    # version history keeps expiring)
+    if [ -r "$STATE_DIR/expected" ]; then
+      die "REMOTE DELETION: 0 kits on $REMOTE but the last backup recorded $(cat "$STATE_DIR/expected" 2>/dev/null) — recover them from the provider's version history NOW, and do NOT run a backup first"
+    fi
+    die "no kit on $REMOTE to drill against — run a backup first"
+  fi
+  ts="$(kit_ts "$name")"
+  # freshness gate: a green drill on a STALE kit masks silently-stopped backups
+  local kd="${ts%_*}" kt="${ts#*_}"; kt="${kt//-/:}"
+  local kit_epoch; kit_epoch="$(date -d "$kd $kt" +%s 2>/dev/null || echo 0)"
+  if [ "$kit_epoch" -gt 0 ]; then
+    local age_days=$(( ( $(date +%s) - kit_epoch ) / 86400 )) max_age="${TIMECRATE_MAX_AGE_DAYS:-3}"
+    [ "$age_days" -gt "$max_age" ] && warn "DRILL STALE: newest cloud kit is ${age_days}d old (> ${max_age}d) — backups may have STOPPED"
+  fi
+  local kit="$t/kit.gpg"; log "fetching kit $ts from $REMOTE…"
+  rc copyto "$REMOTE/$name" "$kit"
+  [ -s "$kit" ] || die "fetched kit is empty ($kit) — check remote path $REMOTE"
+  log "decrypting with ONLY the escrowed key + verifying signature + archive listing…"
+  local derr dec st; derr="$(mktemp)"; dec="$t/kit.tar.zst"; st="$t/gpg-status"
+  set +e
+  gpg --batch --no-tty --yes --status-file "$st" -o "$dec" -d "$kit" 2>"$derr"
+  local grc=$?
+  zstd -dc --long=$ZSTD_LONG < "$dec" 2>/dev/null | tar -tf - >/dev/null 2>&1
+  local -a prc=("${PIPESTATUS[@]}")
+  set -e
+  # signature verdict (verify-before-trust; the --allow-unsigned hatch closed 2026-07-31 and the
+  # pre-v1.3.0 transition hatch, window closes ~2026-08-06)
+  local sig_ok=0 seen="" expected sig_msg="UNSIGNED kit"
+  expected="${TIMECRATE_EXPECT_SIGNER:-}"
+  [ -n "$expected" ] || expected="$(cat "$SIGNING_FILE" 2>/dev/null || true)"
+  [ -n "$expected" ] || expected="$(gpg --batch --show-keys --with-colons "$SIGNING_PUB" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}' || true)"
+  if grep -q '^\[GNUPG:\] VALIDSIG ' "$st" 2>/dev/null; then
+    seen="$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' "$st")"
+    if [ -z "$expected" ]; then
+      sig_msg="UNPINNED signature $seen (no expected signer configured — not trusted)"
+    elif [ "$seen" != "$expected" ]; then
+      sig_msg="signature from UNEXPECTED key $seen (expected: $expected)"
+    else
+      sig_ok=1; sig_msg="signature verified ($seen)"
+    fi
+  fi
+  # ---- remote-wide checks: deletion/rollback detection + verify EVERY kit (not just newest) ----
+  local extra_fail="" nkits=0 nver=0 vk
+  local -a allkits=()
+  mapfile -t allkits < <(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null | kit_sort)
+  nkits=${#allkits[@]}
+  # the remote must still hold what the last backup recorded — an attacker deleting kits (or
+  # re-uploading old ones) is invisible to per-kit signature checks, every old kit signs clean
+  if [ -r "$STATE_DIR/expected" ]; then
+    # NB: a negative subscript into an empty array is FATAL under set -u (':-' does not save
+    # it) — guard nkits; an empty listing is itself a deletion signal handled by the count check
+    local exp_latest exp_count newest=""
+    if [ "$nkits" -gt 0 ]; then newest="${allkits[nkits-1]}"; fi
+    exp_latest="$(awk '{print $1}' "$STATE_DIR/expected" || true)"
+    exp_count="$(awk '{print $2}' "$STATE_DIR/expected" || true)"
+    if [ -n "$exp_latest" ] && [ -n "$newest" ] && kit_older "$newest" "$exp_latest"; then
+      extra_fail="REMOTE ROLLBACK: newest remote kit $newest is OLDER than expected $exp_latest"
+    fi
+    case "$exp_count" in ''|*[^0-9]*) :;; *)
+      [ "$nkits" -ge "$exp_count" ] || extra_fail="${extra_fail:+$extra_fail; }REMOTE DELETION: $nkits kits on remote, expected >= $exp_count (recover them from the provider's version history)";;
+    esac
+  fi
+  # sha256 sidecar is only a cheap pre-filter (remote-write attackers forge sidecars too);
+  # the signature is the proof. Newest kit was already fully drilled above.
+  local badkits=""
+  for vk in "${allkits[@]:-}"; do
+    [ -n "$vk" ] || continue
+    [ "$vk" = "$name" ] && { nver=$((nver+1)); continue; }
+    local vf="$t/allv.gpg" vst="$t/allv.st"
+    rc copyto "$REMOTE/$vk" "$vf" 2>/dev/null || { badkits="${badkits:+$badkits, }$vk(fetch)"; continue; }
+    rc copyto "$REMOTE/$vk.sha256" "$vf.sha256" 2>/dev/null || true
+    if [ -s "$vf.sha256" ] && [ "$(sha256sum "$vf" | cut -d' ' -f1)" != "$(awk '{print $1}' "$vf.sha256")" ]; then
+      badkits="${badkits:+$badkits, }$vk(sha256)"; rm -f "$vf" "$vf.sha256"; continue
+    fi
+    gpg --batch --no-tty --yes --status-file "$vst" -o /dev/null -d "$vf" 2>/dev/null || true
+    if grep -q '^\[GNUPG:\] VALIDSIG ' "$vst"; then
+      if [ -z "$expected" ] || grep -q "^\[GNUPG:\] VALIDSIG $expected" "$vst"; then nver=$((nver+1))
+      else badkits="${badkits:+$badkits, }$vk(wrong-signer)"; fi
+    elif ! grep -q '^\[GNUPG:\] DECRYPTION_OKAY' "$vst"; then
+      badkits="${badkits:+$badkits, }$vk(decrypt)"
+    else
+      badkits="${badkits:+$badkits, }$vk(unsigned)"
+    fi
+    rm -f "$vf" "$vf.sha256" "$vst"
+  done
+  [ -z "$badkits" ] || extra_fail="${extra_fail:+$extra_fail; }KIT VERIFY FAILED: $badkits"
+  log "remote sweep: $nkits kits, $nver signature-verified${badkits:+, BAD: $badkits}"
+  # the mirror is anchor-checked (newest + count vs what the last backup recorded) — enough to
+  # catch a wiped/rotted REMOTE2 that per-backup mirror verification can never see
+  if [ -n "$REMOTE2" ] && [ -r "$STATE_DIR/expected2" ]; then
+    local l2 n2 e2l e2c
+    l2="$(rc lsf "$REMOTE2" --include "$KIT_GLOB" 2>/dev/null | kit_sort || true)"
+    n2="$(printf '%s\n' "$l2" | grep -c . || true)"
+    e2l="$(awk '{print $1}' "$STATE_DIR/expected2" || true)"
+    e2c="$(awk '{print $2}' "$STATE_DIR/expected2" || true)"
+    if [ -n "$e2l" ] && ! printf '%s\n' "$l2" | grep -qFx "$e2l"; then
+      extra_fail="${extra_fail:+$extra_fail; }REMOTE2 DEGRADED: recorded newest $e2l missing from $REMOTE2"
+    fi
+    case "$e2c" in ''|*[^0-9]*) :;; *)
+      [ "${n2:-0}" -ge "$e2c" ] || extra_fail="${extra_fail:+$extra_fail; }REMOTE2 DELETION: ${n2:-0} kits, expected >= $e2c";;
+    esac
+    log "remote2 anchor check: ${n2:-0} kits on $REMOTE2 (expected >= ${e2c:-?})"
+  fi
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if [ "$grc" = 0 ] && [ "${prc[0]:-9}" = 0 ] && [ "${prc[1]:-9}" = 0 ] \
+     && [ -z "$extra_fail" ] \
+     && [ "$sig_ok" = 1 ]; then
+    rm -f "$derr"; write_escrow_confirmed 2>/dev/null || true
+    # machine-readable result: the status pill (CLI + GUI) reads this, not the journal
+    printf '%s drill PASSED %s\n' "$(date -Is)" "$ts" >> "$STATE_DIR/log" 2>/dev/null || true
+    write_status
+    log "RECOVERY DRILL PASSED — the escrowed key alone decrypts AND authenticates a real backup ($sig_msg)."
+  else
+    printf '%s drill FAILED %s\n' "$(date -Is)" "$ts" >> "$STATE_DIR/log" 2>/dev/null || true
+    write_status
+    warn "stage exits: gpg=$grc zstd=${prc[0]:-?} tar=${prc[1]:-?}; sig: $sig_msg; gpg: $(tail -2 "$derr" | tr '\n' ' ')"
+    [ -z "$extra_fail" ] || warn "remote checks: $extra_fail"
+    rm -f "$derr"; die "RECOVERY DRILL FAILED — ${extra_fail:-kit $ts did not decrypt+verify with key '$keyfile'}. FIX ESCROW/SIGNING/REMOTE BEFORE TRUSTING IT."
+  fi
+}
+
+cmd_escrow_confirm(){ mkdir -p "$CONF_DIR"; write_escrow_confirmed; write_status; log "escrow marked confirmed."; }
+
+# Write one setting into the per-user config. Mirrors what the settings window does, because the
+# engine now has commands that change configuration too. Atomic, shell-quoted (this file is
+# sourced), and keeps exactly one .bak -- the documented rollback in the plan's migration rules.
+write_user_setting(){
+  local name="$1" value="$2"
+  mkdir -p "$(dirname "$USER_CONF")" 2>/dev/null || true
+  TC_W_PATH="$USER_CONF" TC_W_NAME="$name" TC_W_VALUE="$value" python3 -c '
+import os, re, shlex
+path, name, value = os.environ["TC_W_PATH"], os.environ["TC_W_NAME"], os.environ["TC_W_VALUE"]
+try:
+    lines = open(path, encoding="utf-8").read().splitlines()
+except FileNotFoundError:
+    lines = ["# Timecrate - per-user settings.",
+             "# Overrides the system config; the environment still wins over both.",
+             "# `timecrate config` shows what is actually in effect."]
+else:
+    try:                                     # one .bak, overwritten each time: the rollback path
+        mode = os.stat(path).st_mode & 0o777
+        fd = os.open(path + ".bak", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as bak:
+            bak.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+entry = "%s=%s" % (name, shlex.quote(value))
+pat = re.compile(r"^\s*(?:export\s+)?%s=" % re.escape(name))
+for i, line in enumerate(lines):
+    if pat.match(line):
+        lines[i] = entry
+        break
+else:
+    lines.append(entry)
+# Inherit the existing mode rather than the umask: nothing guarantees this file stays free of
+# sensitive settings just because the current version of it happens to be.
+try:
+    mode = os.stat(path).st_mode & 0o777
+except OSError:
+    mode = 0o600
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines).rstrip() + "\n")
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+' || die "could not write $USER_CONF"
+}
+
+# ============================ history and alerting ============================
+# Two questions this tool could not answer about itself: what has it been doing, and would it
+# actually reach you if it stopped.
+
+# The state log is append-only and has grown fields over time:
+#   <iso> ok    <ts> <file> [bytes] [seconds]     -- pre-1.9.0 lines have neither trailing field
+#   <iso> drill <PASSED|FAILED> <ts>
+# Readers must tolerate both shapes, so parse by record type and never by field count.
+cmd_history(){
+  local json=0 limit=20
+  while [ $# -gt 0 ]; do case "$1" in
+    --json) json=1;;
+    -n) limit="${2:-20}"; shift;;
+    --*) die "unknown history flag: $1";;
+  esac; shift; done
+  case "$limit" in ''|*[^0-9]*) die "-n takes a number";; esac
+  [ -r "$STATE_DIR/log" ] || { [ "$json" = 1 ] && echo '[]' || log "no history yet ($STATE_DIR/log)"; return 0; }
+
+  TC_H_LOG="$STATE_DIR/log" TC_H_LIMIT="$limit" TC_H_JSON="$json" python3 -c '
+import json, os, sys
+rows = []
+for line in open(os.environ["TC_H_LOG"], encoding="utf-8", errors="replace"):
+    f = line.split()
+    if len(f) < 3:
+        continue
+    when, kind = f[0], f[1]
+    if kind == "drill":
+        rows.append({"when": when, "kind": "drill", "result": f[2],
+                     "bytes": "", "seconds": "", "name": f[3] if len(f) > 3 else ""})
+    elif kind in ("ok", "fail"):
+        # bytes/seconds are appended fields: absent on anything written before 1.9.0, and absent
+        # is UNKNOWN rather than zero.
+        rows.append({"when": when, "kind": "backup", "result": kind,
+                     "name": f[3] if len(f) > 3 else "",
+                     "bytes": f[4] if len(f) > 4 and f[4].isdigit() else "",
+                     "seconds": f[5] if len(f) > 5 and f[5].isdigit() else ""})
+rows = rows[-int(os.environ["TC_H_LIMIT"]):]
+if os.environ["TC_H_JSON"] == "1":
+    print(json.dumps(rows)); sys.exit(0)
+def hb(n):
+    if not n: return "size unknown"
+    n = float(n)
+    for u in ("B","KB","MB","GB","TB"):
+        if n < 1024 or u == "TB": return "%.1f %s" % (n, u)
+        n /= 1024
+for r in reversed(rows):
+    if r["kind"] == "drill":
+        print("  %s  drill %s" % (r["when"][:19], r["result"]))
+    else:
+        dur = ("%ss" % r["seconds"]) if r["seconds"] else "duration unknown"
+        print("  %s  backup %-4s %-12s %s" % (r["when"][:19], r["result"], hb(r["bytes"]), dur))
+'
+}
+
+# Whether a failure would actually reach anyone. The key lives in the root-only secrets file, so
+# an unprivileged run genuinely cannot tell -- and saying "not configured" in that case would be
+# the same lie as reporting an unreadable keyring as an absent one.
+cmd_alerts(){
+  local sub="${1:-status}"
+  case "$sub" in
+    status|--json) ;;
+    test) need_root "alerts test"; alerts_test; return $?;;
+    *) die "unknown alerts subcommand '$sub' — expected status or test";;
+  esac
+  local json=0; [ "$sub" = --json ] && json=1
+  [ "${2:-}" = --json ] && json=1
+
+  # The command may be set in the root-only secrets file. An unprivileged run that cannot read it
+  # cannot know, and saying "not configured" then would be the same lie as reporting an unreadable
+  # keyring as an absent one.
+  local readable=true configured=""
+  if [ -n "$ALERT_CMD" ]; then configured=true
+  elif [ -e "$SECRET_ENV" ] && [ ! -r "$SECRET_ENV" ]; then readable=false
+  else configured=false; fi
+
+  if [ "$json" = 1 ]; then
+    TC_A_READABLE="$readable" TC_A_CONF="$configured" TC_A_CMD="$ALERT_CMD" \
+    TC_A_SEV="$ALERT_SEVERITY" TC_A_FILE="$SECRET_ENV" \
+    python3 -c '
+import json, os
+e = os.environ.get
+print(json.dumps({
+  "readable": e("TC_A_READABLE") != "false",
+  # "" means could not tell, which is NOT the same as false
+  "configured": {"true": True, "false": False}.get(e("TC_A_CONF",""), ""),
+  # what a FAILURE runs, and at what severity
+  "command": e("TC_A_CMD",""), "severity": e("TC_A_SEV",""),
+  "secrets_file": e("TC_A_FILE",""),
+}))'
+    return 0
+  fi
+
+  echo "Failure alerts"
+  if [ "$readable" = false ]; then
+    printf '  status       CANNOT TELL — %s is root-only, and TIMECRATE_ALERT_CMD may be set there.\n' "$SECRET_ENV"
+    printf '               Check with:  sudo %s alerts\n' "$SELF"
+  elif [ "$configured" = true ]; then
+    printf '  status       configured — a failure runs %s (severity %s)\n' "$ALERT_CMD" "$ALERT_SEVERITY"
+    [ -x "$ALERT_CMD" ] || printf '  WARNING      %s is not an executable file, so nothing would be delivered\n' "$ALERT_CMD"
+    printf '  test it      sudo %s alerts test   — sends a real alert, so you find out now\n' "$SELF"
+  else
+    printf '  status       journal only — a failed backup or drill is written to the system journal and\n'
+    printf '               sent nowhere else. Set TIMECRATE_ALERT_CMD (ALERTS in timecrate(1)).\n'
+  fi
+}
+
+alerts_test(){
+  local runner="" d
+  for d in "$HERE/deploy" /usr/libexec/timecrate; do
+    [ -x "$d/alert.sh" ] && { runner="$d/alert.sh"; break; }
+  done
+  [ -n "$runner" ] || die "alert.sh not found — looked in $HERE/deploy and /usr/libexec/timecrate"
+  [ -n "$ALERT_CMD" ] || die "TIMECRATE_ALERT_CMD is not set, so a failure is written to the system journal and sent nowhere else. Set it in $SYSTEM_CONF or $SECRET_ENV (ALERTS in timecrate(1))."
+  log "sending a test alert down the same path a failure would take…"
+  # Deliberately the real runner, the real command and a failure's severity: an alert path that is
+  # only ever exercised by a real failure is one nobody knows is broken, and a test sent at a
+  # friendlier severity would prove a path that failures do not take.
+  printf 'Test alert from Timecrate on %s. Sent down the same path and at the same severity as a failed backup or drill, so the path that matters is the one being proved. Nothing is actually wrong.\n' "$(hostname)" \
+    | TIMECRATE_ALERT_CMD="$ALERT_CMD" "$runner" "$ALERT_SEVERITY" "Timecrate alert test (not a real failure)" test \
+    || die "the alert did NOT go through — a real failure would not reach you either"
+  log "delivered. If that did not arrive, the alert path is broken even though this said it sent."
+}
+
+# ============================ include / exclude lists ============================
+# The two files that decide what a kit contains. They live in /etc and are root-owned, which is
+# why the front-end could only ever OPEN them: it ran as the user, so "Edit" led to a read-only
+# buffer and a saved-file error. Editing them is a privileged operation, so it belongs here,
+# behind the same pkexec binary as backup and restore.
+
+paths_file(){
+  case "$1" in
+    include) printf '%s' "$INCLUDE_FILE";;
+    exclude) printf '%s' "$EXCLUDE_FILE";;
+    *) die "expected 'include' or 'exclude', got '$1'";;
+  esac
+}
+
+# Entries are stored relative to / (tar --files-from runs with -C /), except ~/ which the engine
+# expands against the CONFIGURED user's home so a shipped list survives a different username.
+# Normalising here means the front-end can hand over whatever the file chooser produced.
+paths_normalise(){
+  local p="$1"
+  # These are case PATTERNS matching a literal "~/" prefix, not an expansion: the engine expands
+  # ~/ itself against the configured user home at build time. The directive has to sit directly
+  # against the command it covers, with no comment line in between, or it does not apply.
+  # shellcheck disable=SC2088
+  case "$p" in
+    "~/"*) printf '%s' "$p"; return 0;;
+    "$USER_HOME"/*) printf '~/%s' "${p#"$USER_HOME"/}"; return 0;;
+    /*) printf '%s' "${p#/}"; return 0;;
+    *) printf '%s' "$p"; return 0;;
+  esac
+}
+
+# What is covered, what is skipped, and — the part nothing else answers — what is neither.
+#
+# The include list is an ALLOWLIST: anything not named is silently absent from every kit, and until
+# this command existed nothing said so. A real audit found /usr/local missing entirely (software
+# that comes from no package, so the dpkg replay cannot recreate it) and thirty-plus uncovered
+# settings directories, on a box whose backups had been reporting success nightly for weeks.
+#
+# It classifies against build_include/build_exclude — the SAME functions the backup feeds to tar —
+# rather than re-reading the files, so this view and the kit cannot drift apart.
+#
+#   included  the path, or an ancestor of it, is in the include list
+#   partial   only part of this tree is included (an include entry sits underneath it)
+#   excluded  an exclude rule matches, and the rule is named
+#   UNLISTED  nothing matches: it is silently absent from every kit
+cov_classify(){   # <relpath> ; echoes "state<TAB>rule"
+  local p="$1" inc exc comp
+  while IFS= read -r exc; do
+    [ -n "$exc" ] || continue
+    # Unquoted on the right of `case` ON PURPOSE: tar's --exclude patterns are globs, so `*.pyc`
+    # and `_tmp_*` have to match here too. Quoting them made this classifier literal-only, which
+    # meant coverage could call a file included that the backup then excluded — the one thing this
+    # command promises cannot happen.
+    # shellcheck disable=SC2254
+    case "$p" in $exc|$exc/*) printf 'excluded\t%s\n' "$exc"; return;; esac
+    # A pattern without a slash matches ANY path component, which is how tar applies it.
+    case "$exc" in
+      */*) ;;
+      *) local IFS_SAVE="$IFS"; IFS=/
+         for comp in $p; do
+           # shellcheck disable=SC2254
+           case "$comp" in $exc) IFS="$IFS_SAVE"; printf 'excluded\t%s\n' "$exc"; return;; esac
+         done
+         IFS="$IFS_SAVE" ;;
+    esac
+  done <<< "$COV_EXC"
+  while IFS= read -r inc; do
+    [ -n "$inc" ] || continue
+    case "$p" in "$inc"|"$inc"/*) printf 'included\t%s\n' "$inc"; return;; esac
+  done <<< "$COV_INC"
+  while IFS= read -r inc; do
+    [ -n "$inc" ] || continue
+    case "$inc" in "$p"/*) printf 'partial\t%s\n' "$inc"; return;; esac
+  done <<< "$COV_INC"
+  printf 'UNLISTED\t-\n'
+}
+
+cmd_coverage(){
+  local json=0 sizes=1 warn_mb="${TIMECRATE_COVERAGE_WARN_MB:-100}" roots=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)     json=1 ;;
+      --no-size)  sizes=0 ;;
+      --warn-mb)  shift; warn_mb="${1:-100}" ;;
+      --root)     shift; roots="$roots ${1:-}" ;;
+      -h|--help)  echo "usage: $SELF coverage [--root PATH]... [--json] [--no-size] [--warn-mb N]"; return 0 ;;
+      *) die "unknown coverage option '$1'" ;;
+    esac
+    shift
+  done
+  # Default roots are where the gaps actually hide: the top of the filesystem, the top of the
+  # backed-up user's home, and inside .config — a hand-picked settings list rots exactly there.
+  [ -n "$roots" ] || roots="/ $USER_HOME $USER_HOME/.config"
+  # Named explicitly rather than left to `set -e`. Without this a missing list aborted the command
+  # with NO output at all — a silent death, which is precisely the behaviour this tool exists to
+  # stamp out, and it would have looked like "nothing is uncovered".
+  [ -r "$INCLUDE_FILE" ] || die "include list missing/unreadable: $INCLUDE_FILE"
+  [ -r "$EXCLUDE_FILE" ] || die "exclude list missing/unreadable: $EXCLUDE_FILE"
+  # `|| true` is load-bearing. build_exclude ends in a `[ -n "$p" ] && printf` loop, so it returns
+  # NON-ZERO whenever the last of CONF_DIR/RCLONE_CONF/STAGING_ROOT happens to be empty — and under
+  # `set -e` that killed this command with no output and no message at all. Their OUTPUT is the
+  # contract here, not their exit status; the readable-file checks above are what actually guard it.
+  COV_INC="$(build_include || true)"; COV_EXC="$(build_exclude || true)"
+  local rows="" root entry rel st rule kb
+  for root in $roots; do
+    [ -d "$root" ] || continue
+    for entry in "$root"/* "$root"/.[!.]*; do
+      [ -e "$entry" ] || continue
+      rel="${entry#/}"
+      IFS=$'\t' read -r st rule <<< "$(cov_classify "$rel")"
+      kb=0
+      # `|| true` and the fallback are load-bearing: du exits non-zero on any unreadable
+      # subdirectory, and under `set -e` that ended the whole report early — which would have
+      # looked exactly like "there is nothing else uncovered".
+      [ "$sizes" = 1 ] && { kb="$(du -sxk "$entry" 2>/dev/null | tail -1 | cut -f1 || true)"; kb="${kb:-0}"; }
+      rows="$rows$st\t${kb:-0}\t$rel\t$rule\n"
+    done
+  done
+  if [ "$json" = 1 ]; then
+    printf '%b' "$rows" | TC_WARN_MB="$warn_mb" python3 -c '
+import json, os, sys
+warn = int(os.environ.get("TC_WARN_MB", "100"))
+out = []
+for line in sys.stdin.read().splitlines():
+    if not line.strip(): continue
+    st, kb, path, rule = (line.split("\t") + ["", "", "", ""])[:4]
+    out.append({"state": st, "kb": int(kb or 0), "path": path, "rule": rule})
+un = [r for r in out if r["state"] == "UNLISTED" and r["kb"] >= warn * 1024]
+print(json.dumps({"warn_mb": warn, "entries": sorted(out, key=lambda r: -r["kb"]),
+                  "unlisted_over_warn": sorted(un, key=lambda r: -r["kb"])}, indent=1))'
+    return 0
+  fi
+  # Largest first, and UNLISTED first within that: the actionable rows are the ones nothing covers.
+  # LC_ALL=C: the worst-first ordering relies on comparing state names, and under another
+  # collation "UNLISTED" does not necessarily sort where this expects — the most important rows
+  # would quietly stop being the first ones you read.
+  printf '%b' "$rows" | LC_ALL=C sort -t"$(printf '\t')" -k1,1r -k2,2nr | awk -F'\t' -v warn="$warn_mb" '
+    function human(k){ return k>=1048576 ? sprintf("%.1fG", k/1048576) : (k>=1024 ? sprintf("%dM", k/1024) : sprintf("%dK", k)) }
+    { printf "  %-9s %8s  %-52s %s\n", $1, human($2), $3, ($4=="-"?"":$4)
+      if ($1=="UNLISTED" && $2/1024 >= warn) big++ }
+    END { if (big) printf "\n  %d unlisted director%s over %sMB — nothing in any kit covers them.\n", big, (big==1?"y":"ies"), warn }'
+}
+
+cmd_paths(){
+  local which="${1:-}" action="${2:-list}" arg="${3:-}"
+  [ -n "$which" ] || die "usage: $SELF paths <include|exclude> [list|add <path>|remove <path>]"
+  local file; file="$(paths_file "$which")"
+
+  case "$action" in
+    list)
+      [ -r "$file" ] || die "cannot read $file"
+      grep -vE '^[[:space:]]*(#|$)' "$file" || true
+      return 0;;
+    add|remove) ;;
+    *) die "unknown paths action '$action' — expected list, add or remove";;
+  esac
+
+  need_root paths
+  [ -n "$arg" ] || die "usage: $SELF paths $which $action <path>"
+  # A newline would inject a second entry; .. would let a relative entry climb out of the tree it
+  # is meant to describe. Both arrive from a graphical file chooser, so neither is hypothetical.
+  # Control bytes only. The first cut rejected everything outside printable ASCII, which refused
+  # perfectly ordinary filenames -- /home/user/Résumé is not an attack, and tar handles it fine.
+  case "$arg" in
+    *[$'\001'-$'\037'$'\177']*) die "path contains a control character or newline";;
+    *..*) die "path may not contain '..'";;
+  esac
+  local entry; entry="$(paths_normalise "$arg")"
+  [ -n "$entry" ] || die "empty path"
+  [ -w "$file" ] || die "cannot write $file"
+
+  # add/remove is read-whole-file, write-temp, rename. Two of those interleaved means the second
+  # rename discards the first edit, with nothing to show for it. Lock a companion file rather
+  # than the list itself: the rename replaces the list's inode, so a lock held on it would not be
+  # seen by whoever opens the new one.
+  exec 9>>"${file}.lock" || die "cannot create a lock beside $file"
+  flock -x 9 || die "could not lock $file"
+
+  local tmp; tmp="$(mktemp "${file}.XXXXXX")"
+  # Preserve the file's mode: these are conffiles and a 644 list should not come back 600 (or
+  # worse, world-writable) because of whatever umask the caller happened to have.
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+  if [ "$action" = add ]; then
+    if grep -qxF "$entry" "$file"; then
+      rm -f "$tmp"; exec 9>&-; log "$entry is already in the $which list"; return 0
+    fi
+    cat "$file" > "$tmp"
+    printf '%s\n' "$entry" >> "$tmp"
+    mv -f "$tmp" "$file"
+    log "added to $which: $entry"
+  else
+    grep -qxF "$entry" "$file" || { rm -f "$tmp"; exec 9>&-; die "$entry is not in the $which list"; }
+    grep -vxF "$entry" "$file" > "$tmp" || true
+    mv -f "$tmp" "$file"
+    log "removed from $which: $entry"
+  fi
+  # Say what it costs, because the size rails are what turn a bad edit into a refused backup at
+  # 03:00 rather than a silently wrong one.
+  exec 9>&-
+  log "run '$SELF backup --dry-run' to see what the kit would contain now."
+}
+
+# ============================ remote management ============================
+# Everything about WHERE the backups go. Unprivileged: the rclone config belongs to the configured
+# user, same reasoning as the keyring.
+#
+# SECRETS NEVER LEAVE THIS SECTION. `rclone config show`/`dump` print the OAuth token in full, so
+# nothing here shells out to them for display -- config is parsed and only whitelisted fields are
+# emitted. A token in the activity log is a token in the backup, in the journal, and in CI.
+
+remote_name(){ printf '%s' "${REMOTE%%:*}"; }
+
+# Whitelisted fields only, straight out of rclone's own JSON. Never the token itself -- only
+# whether one exists and when it expires.
+remote_conf_facts(){
+  local name; name="$(remote_name)"
+  [ -n "$name" ] || return 0
+  rc config dump 2>/dev/null | TC_RNAME="$name" python3 -c '
+import json, os, sys
+try:
+    conf = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+r = conf.get(os.environ["TC_RNAME"]) or {}
+tok = r.get("token") or ""
+expiry = ""
+if tok:
+    try:
+        expiry = (json.loads(tok) or {}).get("expiry", "") or ""
+    except Exception:
+        expiry = "unparsable"
+# type, whether a token exists at all, and its expiry. Nothing else.
+print(json.dumps({"type": r.get("type", ""), "has_token": bool(tok), "token_expiry": expiry}))
+' 2>/dev/null || true
+}
+
+cmd_remote(){
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    status)     remote_status "$@";;
+    connect)    remote_connect "$@";;
+    test)       remote_test "$@";;
+    browse)     remote_browse "$@";;
+    mkdir)      remote_mkdir "$@";;
+    set-path)   remote_set_path "$@";;
+    disconnect) remote_disconnect "$@";;
+    *) die "unknown remote subcommand '$sub' — expected status, connect, test, browse, mkdir, set-path or disconnect";;
+  esac
+}
+
+remote_status(){
+  local json=0; [ "${1:-}" = --json ] && json=1
+  # deliberately NOT require_tools cloud: "there is no remote" is a status this command has to be
+  # able to report, not a reason for it to refuse to run
+  have rclone || die "rclone is not installed"
+  local name facts reachable=false kits="" last=""
+  name="$(remote_name)"
+  facts="$(remote_conf_facts)"
+  local listing lrc=0
+  listing="$(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null)" || lrc=$?
+  if [ "$lrc" = 0 ]; then
+    reachable=true
+    kits="$(printf '%s' "$listing" | grep -c . || true)"
+  fi
+  last="$(grep ' ok ' "$STATE_DIR/log" 2>/dev/null | tail -1 | awk '{print $1}' || true)"
+  local acct=""
+  acct="$(rc config userinfo "$name:" 2>/dev/null | awk -F': *' '/[Ee]mail/{print $2; exit}' || true)"
+  # Quota belongs to the whole remote, not the backup folder — same call `status` makes, so the
+  # two views cannot disagree. Leaving it out entirely made the front-end say "not reported by
+  # this provider" about a provider that reports it perfectly well.
+  local about=""
+  [ -n "$REMOTE" ] && { about="$(rc about "${REMOTE%%:*}:" --json 2>/dev/null)" || about=""; }
+
+  if [ "$json" = 1 ]; then
+    # NOT "${facts:-{}}": bash ends the expansion at the first } inside the default, so that
+    # appends a stray brace and the JSON silently fails to parse -- which showed up as the text
+    # output naming the backend while --json swore nothing was configured.
+    [ -n "$facts" ] || facts='{}'
+    TC_R_REMOTE="$REMOTE" TC_R_NAME="$name" TC_R_FACTS="$facts" TC_R_REACH="$reachable" \
+    TC_R_KITS="$kits" TC_R_LAST="$last" TC_R_ACCT="$acct" TC_R_CONF="$RCLONE_CONF" \
+    TC_R_ABOUT="$about" \
+    python3 -c '
+import json, os
+e = os.environ.get
+try: facts = json.loads(e("TC_R_FACTS") or "{}")
+except Exception: facts = {}
+# a backend that cannot answer `about` is not a backend at quota zero
+quota = {"remote_quota_used": "", "remote_quota_total": ""}
+try:
+    a = json.loads(e("TC_R_ABOUT") or "{}")
+    if a.get("total") is not None: quota["remote_quota_total"] = str(a["total"])
+    if a.get("used") is not None:  quota["remote_quota_used"]  = str(a["used"])
+except Exception:
+    pass
+print(json.dumps({
+  "remote": e("TC_R_REMOTE",""), "name": e("TC_R_NAME",""),
+  "type": facts.get("type",""), "configured": bool(facts.get("type")),
+  "has_token": bool(facts.get("has_token")), "token_expiry": facts.get("token_expiry",""),
+  "account": e("TC_R_ACCT",""),
+  # reachable is a fact about right now; "" kits means we could not ask, never zero
+  "reachable": e("TC_R_REACH") == "true", "kits": e("TC_R_KITS",""),
+  "last_backup": e("TC_R_LAST",""), "rclone_config": e("TC_R_CONF",""),
+  **quota,
+}))'
+    return 0
+  fi
+
+  echo "Remote"
+  if [ -z "$REMOTE" ]; then
+    printf '  path         NONE — this machine is not pointed at a remote.\n'
+    printf '               Set one with:  %s remote set-path <remote:path>\n' "$SELF"
+    return 0
+  fi
+  printf '  path         %s\n' "$REMOTE"
+  local rtype; rtype="$(printf '%s' "${facts:-}" | python3 -c 'import json,sys
+try: print((json.load(sys.stdin) or {}).get("type",""))
+except Exception: print("")' 2>/dev/null || true)"
+  if [ -n "$rtype" ]; then
+    printf '  backend      %s (rclone remote "%s")\n' "$rtype" "$name"
+  else
+    printf '  backend      NOT CONFIGURED — there is no rclone remote called "%s".\n' "$name"
+    printf '               Connect one with:  %s remote connect\n' "$SELF"
+  fi
+  [ -n "$acct" ] && printf '  account      %s\n' "$acct"
+  local exp; exp="$(printf '%s' "${facts:-}" | python3 -c 'import json,sys
+try: print((json.load(sys.stdin) or {}).get("token_expiry",""))
+except Exception: print("")' 2>/dev/null || true)"
+  [ -n "$exp" ] && printf '  token        renews automatically; current one expires %s\n' "$exp"
+  if [ "$reachable" = true ]; then
+    printf '  reachable    yes — %s backup(s) at this path\n' "${kits:-0}"
+  else
+    printf '  reachable    NO — could not list %s. Run '\''%s remote test'\'' for the reason.\n' "$REMOTE" "$SELF"
+  fi
+  if [ -n "$about" ]; then
+    printf '%s' "$about" | python3 -c '
+import json, sys
+def hb(n):
+    n = float(n)
+    for u in ("B","KB","MB","GB","TB","PB"):
+        if n < 1024 or u == "PB": return "%.1f %s" % (n, u)
+        n /= 1024
+try:
+    a = json.load(sys.stdin)
+    if a.get("total") is not None:
+        print("  space        %s of %s used" % (hb(a.get("used", 0)), hb(a["total"])))
+except Exception:
+    pass' 2>/dev/null || true
+  fi
+  [ -n "$last" ] && printf '  last backup  %s\n' "$last"
+  printf '  config       %s\n' "$RCLONE_CONF"
+}
+
+remote_connect(){
+  local provider=dropbox force=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --provider) provider="${2:-dropbox}"; shift;;
+    --force|--reauthorize) force=1;;
+    --*) die "unknown connect flag: $1";;
+  esac; shift; done
+  have rclone || die "rclone is not installed"
+  local -a headless=()
+  local name; name="$(remote_name)"
+  [ -n "$name" ] || die "no remote configured to connect — set TIMECRATE_REMOTE first, e.g. dropbox:Backup/TIMECRATE"
+
+  local existing; existing="$(remote_conf_facts)"
+  if printf '%s' "$existing" | grep -q '"type": *"[^"]'; then
+    [ "$force" = 1 ] || die "an rclone remote called '$name' already exists. Pass --reauthorize to replace its credentials (the backups themselves are untouched)."
+  fi
+
+  # rclone's OAuth flow wants a browser on this machine. Over SSH there is none, and the failure
+  # is a hang rather than a message, so say the other half of the dance up front.
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    log "no graphical session here, so the browser step has to happen elsewhere:"
+    log "  1. on a machine with a browser:  rclone authorize \"$provider\""
+    log "  2. paste the token it prints when this command asks for it"
+    # config_is_local=false is what actually switches rclone off the local-browser flow. Printing
+    # the instructions without it left the advertised headless path doing local auto-config --
+    # hanging in exactly the environment the message says it supports.
+    headless=(config_is_local=false)
+  fi
+  log "starting the $provider authorisation for rclone remote '$name'…"
+  rc config create "$name" "$provider" "${headless[@]}" || die "rclone could not create the remote"
+  [ -f "$RCLONE_CONF" ] && chmod 600 "$RCLONE_CONF" 2>/dev/null || true
+  log "connected. Checking it works…"
+  remote_test
+}
+
+remote_test(){
+  require_tools cloud
+  local name; name="$(remote_name)"
+  local out rcode=0
+  out="$(rc lsf "$REMOTE" 2>&1)" || rcode=$?
+  if [ "$rcode" = 0 ]; then
+    log "list OK — $REMOTE is readable"
+  else
+    # rclone's exit codes distinguish "not there" from "cannot get in"; the message carries the
+    # rest. Reporting all of these as "remote unreachable" is what sends people to check their
+    # network when the token has simply expired.
+    case "$rcode:$out" in
+      3:*|*"directory not found"*)
+        die "the path $REMOTE does not exist yet on '$name'. Create it with '$SELF remote mkdir $REMOTE', or point somewhere else with '$SELF remote set-path'.";;
+      *401*|*"invalid_grant"*|*"authentication"*|*"token"*|*"expired"*)
+        die "'$name' will not authenticate — its token is rejected or expired. Reconnect with '$SELF remote connect --reauthorize'.";;
+      *"didn't find section"*|*"section not found"*)
+        die "there is no rclone remote called '$name'. Create it with '$SELF remote connect'.";;
+      *)
+        die "cannot reach $REMOTE (rclone exit $rcode): $(printf '%s' "$out" | tail -1)";;
+    esac
+  fi
+
+  # A remote that lists but will not accept a write is a backup that fails at 03:00, not now.
+  local probe=".timecrate-write-probe-$$"
+  if printf 'timecrate write probe\n' | rc rcat "$REMOTE/$probe" 2>/dev/null; then
+    rc deletefile "$REMOTE/$probe" >/dev/null 2>&1 \
+      && log "write OK — created and removed a probe object" \
+      || warn "wrote a probe object but could not delete it: $REMOTE/$probe (remove it by hand)"
+  else
+    die "$REMOTE is readable but NOT writable — backups would fail at upload time. Check the account's permissions or quota."
+  fi
+  log "REMOTE OK."
+}
+
+remote_browse(){
+  local target="" json=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --json) json=1;;
+    --*) die "unknown browse flag: $1";;
+    *) target="$1";;
+  esac; shift; done
+  # An explicit target needs no configured remote — requiring one here made the disconnected
+  # machine unable to look around for somewhere to reconnect to.
+  require_tools
+  have rclone || die "rclone is not installed"
+  [ -n "$target" ] || { require_remote; target="$REMOTE"; }
+  local out rcode=0
+  rc_capture lsd "$target" || rcode=$?
+  [ "$rcode" = 0 ] || die "cannot list $target (rclone exit $rcode): $RC_ERR"
+  out="$RC_OUT"
+  # `lsd` prints: <size> <date> <time> <count> <name>; the name can contain spaces, so take
+  # everything from field 5 on rather than splitting the whole line.
+  if [ "$json" = 1 ]; then
+    printf '%s\n' "$out" | python3 -c '
+import json, sys
+out = []
+for line in sys.stdin:
+    parts = line.rstrip("\n").split(None, 4)
+    if len(parts) == 5 and parts[4]:
+        out.append(parts[4])
+print(json.dumps(out))'
+  else
+    printf '%s\n' "$out" | awk 'NF>=5{ $1=$1; sub(/^([^ ]+ +){4}/,""); print }'
+  fi
+}
+
+remote_mkdir(){
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: $SELF remote mkdir <remote:path>"
+  require_tools; have rclone || die "rclone is not installed"
+  rc mkdir "$target" || die "could not create $target"
+  log "created $target"
+}
+
+remote_set_path(){
+  local target="" yes=0 dry=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --yes|-y) yes=1;;
+    --dry-run) dry=1;;
+    --*) die "unknown set-path flag: $1";;
+    *) target="$1";;
+  esac; shift; done
+  [ -n "$target" ] || die "usage: $SELF remote set-path <remote:path> [--yes]"
+  case "$target" in *:*) ;; *) die "'$target' is not a remote path — it needs the form <remote>:<path>, e.g. dropbox:Backup/TIMECRATE";; esac
+  # NOT require_tools cloud: this is the command that gives a disconnected machine a remote, and
+  # the status output tells people to run it. Demanding one first made that advice a dead end.
+  require_tools; have rclone || die "rclone is not installed"
+  [ "$target" != "$REMOTE" ] || { log "already set to $target — nothing to do"; return 0; }
+
+  # The count at each end is the whole point. Repointing away from a path that holds backups is
+  # how thirteen real kits became invisible for four days; saying so first is cheap.
+  # `lsf | grep -c .` turns an auth failure, an unknown remote and a network fault all into "0",
+  # so a typo would read as "the new path is simply empty" and get written into the live config.
+  # Same rule as everywhere else here: unlistable is UNKNOWN, never a measured zero.
+  local here="" there="" trc
+  trc=0; rc_capture lsf "$target" --include "$KIT_GLOB" || trc=$?
+  if [ "$trc" = 0 ]; then
+    there="$(printf '%s' "$RC_OUT" | grep -c . || true)"
+  else
+    case "$trc:$RC_ERR" in
+      3:*|*"directory not found"*)
+        there=0
+        log "new      $target — does not exist yet; it will be created on the next upload";;
+      *)
+        die "cannot read $target (rclone exit $trc): $RC_ERR
+  Refusing to point backups at a destination that cannot be read — check the name and try '$SELF remote test' after setting it.";;
+    esac
+  fi
+  if [ -n "$REMOTE" ]; then
+    trc=0; rc_capture lsf "$REMOTE" --include "$KIT_GLOB" || trc=$?
+    [ "$trc" = 0 ] && here="$(printf '%s' "$RC_OUT" | grep -c . || true)"
+  fi
+  log "current  ${REMOTE:-(none)} — ${here:-UNKNOWN} backup(s)"
+  [ -n "$there" ] && log "new      $target — ${there} backup(s)"
+  if [ -n "$here" ] && [ "$here" -gt 0 ] && [ "${there:-0}" -eq 0 ]; then
+    warn "the current path holds ${here} backup(s) and the new one holds none. They are not moved or deleted, but nothing will list or restore them until you point back."
+  elif [ -z "$here" ] && [ -n "$REMOTE" ]; then
+    warn "could not read the CURRENT path $REMOTE, so it is unknown whether it holds backups. If it does, they stay where they are and this machine stops seeing them."
+  fi
+  # --dry-run exists so a caller can show the operator the counts and the warning BEFORE anything
+  # is written. Same reason as import-key --dry-run: the confirmation below reads /dev/tty, which
+  # a graphical front-end does not have, and "ask first" is the entire point of this command.
+  if [ "$dry" = 1 ]; then
+    log "DRY RUN — nothing was changed."
+    return 0
+  fi
+  if [ "$yes" != 1 ]; then
+    printf '  Repoint backups to %s? [y/N] ' "$target"
+    local ans=""; read -r ans < /dev/tty 2>/dev/null || die "not a terminal — pass --yes to change the path without a prompt"
+    case "$ans" in y|Y|yes|YES) ;; *) die "unchanged — still $REMOTE";; esac
+  fi
+  write_user_setting TIMECRATE_REMOTE "$target"
+  log "remote is now $target (written to $USER_CONF; the previous file is beside it as .bak)"
+}
+
+remote_disconnect(){
+  local yes=0 drop_rclone=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --yes|-y) yes=1;;
+    --remove-rclone-remote) drop_rclone=1;;
+    --*) die "unknown disconnect flag: $1";;
+  esac; shift; done
+  local name; name="$(remote_name)"
+  if [ "$yes" != 1 ]; then
+    printf '  Forget the remote %s on this machine? [y/N] ' "$REMOTE"
+    local ans=""; read -r ans < /dev/tty 2>/dev/null || die "not a terminal — pass --yes"
+    case "$ans" in y|Y|yes|YES) ;; *) die "unchanged";; esac
+  fi
+  write_user_setting TIMECRATE_REMOTE ""
+  if [ "$drop_rclone" = 1 ] && [ -n "$name" ]; then
+    rc config delete "$name" >/dev/null 2>&1 && log "removed the rclone remote '$name'" \
+      || warn "could not remove the rclone remote '$name'"
+  fi
+  log "this machine no longer points at a remote."
+  # Saying this out loud because "disconnect" reads like it did.
+  log "NOTE: the backups themselves are untouched, and this does NOT revoke access at the provider."
+  log "  Revoke it there if that is what you meant (Dropbox: Settings → Connected apps)."
+}
+
+# ============================ key lifecycle ============================
+# Unprivileged BY DESIGN. Key material lives in the configured user's CONF_DIR, so running any of
+# these under sudo would put the keyring in root's home, where the timers would never look for it.
+
+ESCROW_FILE="$CONF_DIR/.escrow-confirmed"
+
+# The severity a FAILURE is sent at. Defined once so `alerts` cannot describe one thing while
+# `alerts test` exercises another; the wrapper scripts carry the same literal and a check asserts
+# the two agree.
+ALERT_SEVERITY="critical"
+
+# Escrow state used to be a bare `touch`: a file that says "someone confirmed something, once".
+# It cannot say WHICH key was escrowed, so it stayed "confirmed" across a key change and would
+# have green-lit `harden` on a key nobody had ever copied off the box. Two lines now: fingerprint
+# and ISO timestamp.
+#
+# A pre-v1.7.0 empty file is read as CONFIRMED-BUT-UNKNOWN and reported that way. It is never
+# silently upgraded — inventing a fingerprint for it would be the same lie in a new place.
+read_escrow(){
+  ESC_STATE=none; ESC_FPR=""; ESC_WHEN=""
+  [ -f "$ESCROW_FILE" ] || return 0
+  ESC_FPR="$(sed -n 1p "$ESCROW_FILE" 2>/dev/null || true)"
+  ESC_WHEN="$(sed -n 2p "$ESCROW_FILE" 2>/dev/null || true)"
+  if [ -n "$ESC_FPR" ]; then ESC_STATE=confirmed; else ESC_STATE=unknown; fi
+}
+
+write_escrow_confirmed(){
+  local fpr; fpr="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  { printf '%s\n' "$fpr"; date -Is; } > "$ESCROW_FILE" 2>/dev/null || true
+}
+
+# secret half of $1 present in the tool keyring?
+key_secret_present(){ [ -n "${1:-}" ] && gpg_tc --list-secret-keys "$1" >/dev/null 2>&1; }
+
+# An unreadable keyring is not an absent one. On a box where `init` was ever run under sudo, the
+# whole CONF_DIR is root-owned inside the user's home, so an unprivileged read sees nothing --
+# and reporting that as "no key configured" would invite exactly the one-way door the init guard
+# exists to prevent. Same lesson as the v1.5.0 config split-brain, one directory over.
+# Reports WHICH path blocks the read, empty when nothing does.
+#
+# Three distinct ways to be unable to read a key store, and only one of them is CONF_DIR being
+# unreadable. A directory needs -x as well as -r before anything inside it can be opened, and a
+# perfectly traversable CONF_DIR can still hold a root-owned recipients.txt or gnupg/ -- which is
+# the shape a root-run init leaves, one level down. Each of those reads back as "no key configured" unless it is
+# probed for directly, which is the exact confusion this whole mechanism exists to prevent.
+keyring_blocker(){
+  if [ -d "$CONF_DIR" ] && { [ ! -r "$CONF_DIR" ] || [ ! -x "$CONF_DIR" ]; }; then
+    printf '%s' "$CONF_DIR"; return 0
+  fi
+  if [ -e "$RECIPIENTS_FILE" ] && [ ! -r "$RECIPIENTS_FILE" ]; then
+    printf '%s' "$RECIPIENTS_FILE"; return 0
+  fi
+  if [ -d "$GNUPGHOME_TC" ] && { [ ! -r "$GNUPGHOME_TC" ] || [ ! -x "$GNUPGHOME_TC" ]; }; then
+    printf '%s' "$GNUPGHOME_TC"; return 0
+  fi
+  return 0
+}
+keyring_readable(){ [ -z "$(keyring_blocker)" ]; }
+
+cmd_keys(){
+  local json=0
+  [ "${1:-}" = --json ] && json=1
+  local efpr sfpr esec ssec spub
+  efpr="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  sfpr="$(head -1 "$SIGNING_FILE" 2>/dev/null || true)"
+  # four separate facts, not one "is the secret on the box" bit: `harden` destroys the ENCRYPTION
+  # secret and deliberately leaves the SIGNING secret, so collapsing them would misreport a
+  # hardened box as un-hardened.
+  local readable=true owner="" blocker=""
+  blocker="$(keyring_blocker)"
+  if [ -n "$blocker" ]; then
+    readable=false
+    owner="$(stat -c '%U' "$blocker" 2>/dev/null || echo unknown)"
+  fi
+  esec=false; key_secret_present "$efpr" && esec=true
+  ssec=false; key_secret_present "$sfpr" && ssec=true
+  spub=false; [ -s "$SIGNING_PUB" ] && spub=true
+  read_escrow
+
+  if [ "$json" = 1 ]; then
+    TC_K_EFPR="$efpr" TC_K_SFPR="$sfpr" TC_K_ESEC="$esec" TC_K_SSEC="$ssec" TC_K_SPUB="$spub" \
+    TC_K_ESTATE="$ESC_STATE" TC_K_EWHO="$ESC_FPR" TC_K_EWHEN="$ESC_WHEN" \
+    TC_K_ESCROW_FILE="$SECRET_ESCROW" TC_K_READABLE="$readable" TC_K_OWNER="$owner" \
+    TC_K_CONFDIR="${blocker:-$CONF_DIR}" \
+    python3 -c '
+import json, os
+e = os.environ.get
+print(json.dumps({
+  "encryption_fpr": e("TC_K_EFPR",""), "encryption_secret_present": e("TC_K_ESEC")=="true",
+  "signing_fpr": e("TC_K_SFPR",""), "signing_secret_present": e("TC_K_SSEC")=="true",
+  "signing_public_present": e("TC_K_SPUB")=="true",
+  "escrow_state": e("TC_K_ESTATE","none"), "escrow_fpr": e("TC_K_EWHO",""),
+  "escrow_when": e("TC_K_EWHEN",""),
+  "escrow_file_on_box": os.path.exists(e("TC_K_ESCROW_FILE","")),
+  # false means "cannot tell", NOT "nothing is there" -- a caller that treats the two alike
+  # would offer to generate a key on a machine that already has one
+  "keyring_readable": e("TC_K_READABLE") != "false",
+  "keyring_owner": e("TC_K_OWNER",""), "config_dir": e("TC_K_CONFDIR",""),
+}))'
+    return 0
+  fi
+
+  echo "Keys"
+  if [ "$readable" = false ]; then
+    printf '  keyring      UNREADABLE — %s is owned by %s and you are %s.\n' \
+      "$blocker" "$owner" "$(id -un)"
+    printf '               Nothing below can be reported. This is what an `init` run under sudo\n'
+    printf '               leaves behind. Read it with:  sudo %s keys\n' "$SELF"
+    return 0
+  fi
+  if [ -n "$efpr" ]; then
+    printf '  encryption   %s  (RSA-4096)\n' "$efpr"
+    if [ "$esec" = true ]; then
+      printf '  secret half  ON THIS BOX — this machine can decrypt its own backups\n'
+    else
+      printf '  secret half  NOT on this box — encrypt-only (hardened, or never imported).\n'
+      printf '               Restoring here needs '\''%s import-key <escrowed file>'\''\n' "$SELF"
+    fi
+  else
+    printf '  encryption   NONE CONFIGURED — nothing can be backed up or restored yet.\n'
+    printf '               Recovering an existing machine?  %s import-key <escrowed file>\n' "$SELF"
+    printf '               Setting up a brand new one?      %s init\n' "$SELF"
+  fi
+  if [ -n "$sfpr" ]; then
+    printf '  signing      %s  (secret %s, public key %s)\n' "$sfpr" \
+      "$([ "$ssec" = true ] && echo present || echo absent)" \
+      "$([ "$spub" = true ] && echo present || echo MISSING)"
+  else
+    printf '  signing      none — kits from this box would be unsigned (pre-v1.3.0 behaviour)\n'
+  fi
+  case "$ESC_STATE" in
+    none)      printf '  escrow       NOT CONFIRMED — if the secret key is lost these backups are unrecoverable\n';;
+    unknown)   printf '  escrow       confirmed, but by a pre-1.7.0 version that did not record which key or when.\n'
+               printf '               Re-run '\''%s escrow-confirm'\'' to record it properly.\n' "$SELF";;
+    confirmed) if [ "$ESC_FPR" = "$efpr" ]; then
+                 printf '  escrow       confirmed %s for %s\n' "$ESC_WHEN" "$ESC_FPR"
+               else
+                 printf '  escrow       STALE — confirmed for %s, but the current key is %s\n' "$ESC_FPR" "$efpr"
+               fi;;
+  esac
+}
+
+# Import an escrowed secret key. Validated in a THROWAWAY keyring first: a key that fails these
+# checks must never touch the live one, because the failure mode is only visible years later at a
+# restore.
+cmd_import_key(){
+  local src="" spub="" replace=0 yes=0 dry=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --signing-pub) spub="${2:-}"; shift;;
+    --replace) replace=1;;
+    --yes|-y) yes=1;;
+    --dry-run) dry=1;;
+    --*) die "unknown import-key flag: $1";;
+    *) src="$1";;
+  esac; shift; done
+  [ -n "$src" ] || die "usage: $SELF import-key <file|-> [--signing-pub <file>] [--replace] [--yes] [--dry-run]"
+
+  local t; t="$(mktemp -d)"; chmod 700 "$t"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$t'" EXIT
+  local key="$t/in.asc"
+  if [ "$src" = - ]; then cat > "$key"; else
+    [ -r "$src" ] || die "cannot read '$src'"
+    cp "$src" "$key"
+  fi
+  [ -s "$key" ] || die "'$src' is empty"
+
+  mkdir -p "$t/ring"; chmod 700 "$t/ring"
+  GNUPGHOME="$t/ring" gpg --batch --import "$key" >/dev/null 2>&1 \
+    || die "'$src' is not a key GnuPG can read"
+  local info
+  info="$(GNUPGHOME="$t/ring" gpg --batch --with-colons --list-secret-keys 2>/dev/null || true)"
+  [ -n "$info" ] || die "no SECRET key in '$src' — this looks like a public-key export. The escrowed file is the one that starts 'BEGIN PGP PRIVATE KEY BLOCK'."
+
+  local fpr
+  fpr="$(printf '%s\n' "$info" | awk -F: '/^fpr:/{print $10; exit}')"
+  # The algorithm that matters is the one on the ENCRYPTION-capable part, not the primary: gpg
+  # encrypts to the encryption subkey, so an RSA primary carrying a cv25519 encryption subkey
+  # passes a primary-only test and then fails to decrypt after re-import — the precise trap this
+  # refuses. Every encryption-capable part must be RSA, because gpg picks among them, not us.
+  # lowercase 'e' only: the capability field carries this key's own caps in lowercase and the
+  # whole key's aggregate in uppercase, so tolower() would credit an ECC primary with its
+  # subkey's encryption capability and then report the primary's algorithm.
+  printf '%s\n' "$info" | awk -F: '($1=="sec"||$1=="ssb") && $12 ~ /e/ {f=1} END{exit !f}' \
+    || die "key $fpr has no encryption-capable part — it cannot decrypt a Timecrate kit"
+  local badalgo
+  badalgo="$(printf '%s\n' "$info" | awk -F: '($1=="sec"||$1=="ssb") && $12 ~ /e/ && $4!=1 {print $4; exit}')"
+  [ -z "$badalgo" ] \
+    || die "key $fpr encrypts with a non-RSA key (GnuPG algorithm $badalgo). Exported ed25519/cv25519 secret keys do not decrypt after re-import in this GnuPG — importing this would leave every backup unreadable."
+  printf '%s\n' "$info" | awk -F: '$1=="sec" && ($2=="r"||$2=="e"){bad=1} END{exit bad}' \
+    || die "key $fpr is expired or revoked"
+
+  local cur; cur="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  if [ -n "$cur" ] && [ "$cur" != "$fpr" ] && [ "$replace" != 1 ]; then
+    die "a different key is already configured ($cur). Pass --replace to make $fpr the recipient for NEW backups — the old secret is kept, so existing kits stay readable."
+  fi
+
+  # --dry-run exists so a caller can show the operator WHICH key it is about to trust before
+  # anything is written. The confirmation prompt below reads /dev/tty, which a graphical front-end
+  # does not have, so without this the GUI's only options would be "import blind" or "no GUI".
+  # Bare fingerprint on stdout; every other word this command says goes to stderr.
+  if [ "$dry" = 1 ]; then
+    printf '%s\n' "$fpr"
+    warn "validated: RSA, encryption-capable, not expired. NOT imported (--dry-run)."
+    return 0
+  fi
+
+  log "key in '$src': $fpr — RSA, encryption-capable, not expired"
+  if [ "$yes" != 1 ]; then
+    printf '  Import this as the Timecrate decryption key? [y/N] '
+    local ans=""; read -r ans < /dev/tty 2>/dev/null || die "not a terminal — pass --yes to import without a prompt"
+    case "$ans" in y|Y|yes|YES) ;; *) die "aborted — nothing was imported";; esac
+  fi
+
+  umask 077; mkdir -p "$CONF_DIR" "$GNUPGHOME_TC" "$STATE_DIR"; chmod 700 "$GNUPGHOME_TC"
+  gpg_tc --import "$key" >/dev/null 2>&1 || die "import into $GNUPGHOME_TC failed"
+  # --replace ADDS: the previous secret stays in the keyring on purpose, or every kit encrypted
+  # to it before today becomes unreadable the moment this command runs.
+  printf '%s\n' "$fpr" > "$RECIPIENTS_FILE"
+  log "imported. $fpr is now the recipient for new backups."
+  [ -n "$cur" ] && [ "$cur" != "$fpr" ] && log "  previous key $cur kept in the keyring — kits encrypted to it still restore."
+
+  if [ -n "$spub" ]; then
+    [ -r "$spub" ] || die "cannot read signing public key '$spub'"
+    gpg_tc --import "$spub" >/dev/null 2>&1 || die "'$spub' is not a key GnuPG can read"
+    local sfpr
+    sfpr="$(GNUPGHOME="$GNUPGHOME_TC" gpg --batch --with-colons --import-options show-only --import "$spub" 2>/dev/null \
+             | awk -F: '/^fpr:/{print $10; exit}')"
+    [ -n "$sfpr" ] || die "could not read a fingerprint from '$spub'"
+    cp "$spub" "$SIGNING_PUB"; chmod 644 "$SIGNING_PUB"
+    printf '%s\n' "$sfpr" > "$SIGNING_FILE"
+    log "signing public key pinned: $sfpr — restores from this box will verify signatures."
+  elif [ ! -s "$SIGNING_PUB" ]; then
+    warn "no signing public key here — restore can decrypt but cannot AUTHENTICATE a kit. Import it with --signing-pub (it is on the escrow sheet)."
+  fi
+  write_status
+  log "check it worked:  $SELF verify-key"
+}
+
+# "Can THIS box read my backups?" — distinct from recovery-drill, which proves the ESCROWED key
+# works. A box can pass the drill and still be unable to restore, which is exactly the state a
+# freshly reinstalled machine is in.
+cmd_verify_key(){
+  local deep=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --deep) deep=1;;
+    --*) die "unknown verify-key flag: $1";;
+    *) die "verify-key takes no arguments";;
+  esac; shift; done
+  require_tools cloud
+  local cur; cur="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  if [ -z "$cur" ] && ! keyring_readable; then
+    die "cannot read the keyring: $(keyring_blocker) is owned by $(stat -c '%U' "$(keyring_blocker)" 2>/dev/null || echo '?') and you are $(id -un). Retry with sudo, or fix its ownership — this is NOT the same as having no key"
+  fi
+  [ -n "$cur" ] || die "no key configured — run '$SELF import-key <escrowed file>' first"
+
+  local name
+  name="$(rc lsf "$REMOTE" --include "$KIT_GLOB" 2>/dev/null | kit_sort | tail -1)" || true
+  [ -n "$name" ] || die "no kit on $REMOTE to check against (cannot list it, or it is empty)"
+
+  local t; t="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$t'" EXIT
+
+  if [ "$deep" = 1 ]; then
+    log "fetching $name and decrypting it in full…"
+    rc copyto "$REMOTE/$name" "$t/kit.gpg" || die "could not fetch $name"
+    # signature verification is NOT optional here: a check that says "yes you can read this" about
+    # a kit it never authenticated is worth less than no check at all.
+    decrypt_verified "$t/kit.gpg" "$t/out.bin" 0
+    log "VERIFY-KEY OK (deep) — this box decrypted and authenticated $name"
+    return 0
+  fi
+
+  # header only: the recipient key-id is in the first packet, so a few KB answers the question
+  # without pulling 9 MB.
+  rc cat "$REMOTE/$name" --count 8192 > "$t/head.gpg" 2>/dev/null || die "could not read $name"
+  local want
+  want="$(gpg --batch --list-only --list-packets "$t/head.gpg" 2>/dev/null \
+          | sed -n 's/.*keyid \([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F' | sort -u)" || true
+  [ -n "$want" ] || die "could not read the recipient key-id from $name"
+
+  local have_ids
+  have_ids="$(gpg_tc --with-colons --list-secret-keys 2>/dev/null \
+              | awk -F: '($1=="sec"||$1=="ssb"){print toupper($5)}' | sort -u)" || true
+  local hit=""
+  hit="$(comm -12 <(printf '%s\n' "$want") <(printf '%s\n' "$have_ids") | head -1)" || true
+  if [ -z "$hit" ]; then
+    die "this box CANNOT read $name — it is encrypted to $(printf '%s' "$want" | tr '\n' ' ')and no matching secret key is installed. Import the escrowed key:  $SELF import-key <file>"
+  fi
+  local hit_fpr
+  hit_fpr="$(gpg_tc --with-colons --list-secret-keys "$hit" 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')" || true
+  log "VERIFY-KEY OK — $name is encrypted to a key this box holds (${hit_fpr:-$hit})"
+  log "  header check only; '$SELF verify-key --deep' decrypts and authenticates the whole kit."
+}
+
+# Re-escrow. Writing this into the backup set would put the key inside the kits it decrypts, which
+# is the chicken-and-egg failure the escrow exists to avoid.
+cmd_export_key(){
+  local out=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --out) out="${2:-}"; shift;;
+    --*) die "unknown export-key flag: $1";;
+    *) die "usage: $SELF export-key [--out <file>]";;
+  esac; shift; done
+  local fpr; fpr="$(head -1 "$RECIPIENTS_FILE" 2>/dev/null || true)"
+  if [ -z "$fpr" ] && ! keyring_readable; then
+    die "cannot read the keyring: $(keyring_blocker) is owned by $(stat -c '%U' "$(keyring_blocker)" 2>/dev/null || echo '?') and you are $(id -un). Retry with sudo, or fix its ownership"
+  fi
+  [ -n "$fpr" ] || die "no key configured"
+  key_secret_present "$fpr" || die "the secret half of $fpr is not on this box (hardened, or never imported) — there is nothing here to export"
+
+  if [ -n "$out" ]; then
+    local abs; abs="$(readlink -f "$out" 2>/dev/null || printf '%s' "$out")"
+    case "$abs/" in
+      "$CONF_DIR"/*|"$STAGING_ROOT"/*) ;;   # both are excluded from every kit by derivation
+      *) local line
+         while IFS= read -r line; do
+           [ -n "$line" ] || continue
+           case "$abs/" in "/$line/"*)
+             die "refusing to write the secret key to $abs — that path is inside the backup include set, which would ship the key inside the kits it decrypts";;
+           esac
+         done < <(build_include);;
+    esac
+    umask 077
+    gpg_tc --armor --export-secret-keys "$fpr" > "$out" || die "export failed"
+    chmod 600 "$out"
+    log "secret key $fpr written to $out — move it OFF this machine, then '$SELF escrow-confirm'."
+  else
+    gpg_tc --armor --export-secret-keys "$fpr"
+  fi
+}
+
+# ============================ dispatch ============================
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init) cmd_init "$@";;  harden) need_root harden; cmd_harden "$@";;
+  backup) cmd_backup "$@";;  restore) cmd_restore "$@";;
+  list) cmd_list "$@";;  verify) cmd_verify "$@";;  demo) cmd_demo "$@";;  status) cmd_status "$@";;
+  config) cmd_config "$@";;  schedule) cmd_schedule "$@";;
+  break-glass|breakglass) cmd_break_glass "$@";;
+  escrow-doc) cmd_escrow_doc "$@";;
+  recovery-drill|drill) cmd_recovery_drill "$@";;
+  escrow-confirm) need_root escrow-confirm; cmd_escrow_confirm "$@";;
+  # key lifecycle: unprivileged on purpose -- under sudo the keyring lands in root's home
+  remote) cmd_remote "$@";;
+  paths) cmd_paths "$@";;
+  coverage) cmd_coverage "$@";;
+  pause) cmd_pause "$@";;
+  history) cmd_history "$@";;
+  alerts) cmd_alerts "$@";;
+  keys) cmd_keys "$@";;  import-key|import) cmd_import_key "$@";;
+  verify-key) cmd_verify_key "$@";;  export-key) cmd_export_key "$@";;
+  version|--version) echo "timecrate $VERSION";;
+  help|-h|--help) cmd_help;;
+  *) die "unknown command '$cmd' (try: $SELF help)";;
+esac

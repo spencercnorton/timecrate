@@ -1,0 +1,8 @@
+timecrate (3.0.0) resolute; urgency=medium
+
+  * First public release, under the name Timecrate. Kits written by earlier
+    versions are read, verified, restored and pruned as one series with new
+    ones. Alerts go to a command of your choice, include lines may be globs,
+    and the timers are enabled on installation and kept across upgrades.
+
+ -- Norvi <apt@globalentry.systems>  Wed, 30 Sep 2026 00:00:00 +0000

@@ -1,0 +1,21 @@
+[Unit]
+Description=Timecrate monthly recovery drill (prove the off-site backups decrypt)
+Documentation=man:timecrate(1)
+After=network-online.target
+# Persistent= catch-up can queue backup + drill in the same boot transaction; the drill must
+# not race the backup it is about to verify (a mid-upload kit reads as stale/corrupt)
+After=timecrate-backup.service
+Wants=network-online.target
+OnFailure=timecrate-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2h
+EnvironmentFile=-/etc/timecrate.env
+# sandbox — same rationale and exclusions as the backup unit
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ExecStart=/usr/libexec/timecrate/drill-and-alert.sh

@@ -1,0 +1,375 @@
+.TH TIMECRATE 1 "2026-09-30" "timecrate 3.0.0" "System Administration"
+.SH NAME
+timecrate \- encrypted, signed, off\-site disaster\-recovery backup
+.SH SYNOPSIS
+.B timecrate
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B timecrate
+ships the irreplaceable slice of a machine \(em configuration, secrets, identity, hand\-tuned
+state \(em to a cloud remote as a single compressed, encrypted and
+.B signed
+archive called a
+.IR kit .
+Bulk that can be reinstalled or re\-downloaded is deliberately left out; a manifest of installed
+packages, enabled units and desktop settings rides along instead and is replayed at restore.
+.PP
+A kit is built with
+.BR tar (1),
+compressed with
+.BR zstd (1)
+and encrypted to a GPG public key with an AES\-256 session cipher. It is also signed by a
+standalone key, and every path that extracts a kit verifies that signature
+.B before
+writing a single byte \(em a kit that is not signed by the expected key is refused, because
+anyone who can write to the remote could otherwise plant one.
+.PP
+Recovery deliberately needs nothing but
+.BR gpg (1),
+.BR zstd (1)
+and
+.BR tar (1).
+See
+.B break\-glass
+and
+.I BREAK\-GLASS.md
+in
+.IR /usr/share/doc/timecrate/ .
+.SH COMMANDS
+.TP
+.B init " [\fB\-\-new\-identity\fR]"
+Generate the encryption and signing keypairs and print the escrow instructions. Run once. Safe to
+re\-run: existing keys are kept.
+.TP
+.B backup " [\-\-dry\-run] [\-\-no\-upload] [\-\-keep\-staging] [\-\-force]"
+Build a kit and upload it. Requires root.
+.B \-\-dry\-run
+prints the size and top\-level members and ships nothing.
+.B \-\-force
+overrides the size rails \(em see
+.B SAFETY RAILS
+below.
+.TP
+.B list " [\-\-long]"
+List the kits present on the remote. Fails loudly if the remote cannot be read; an unreadable
+remote is never reported as an empty one.
+.B \-\-long
+adds two columns \(em size in bytes and modification time \(em tab\-separated, before the name.
+Bytes are raw rather than human\-formatted because this output is parsed by the graphical
+front\-end; pipe through
+.B numfmt \-\-to=iec \-\-field=1
+for a friendlier column. Bare
+.B list
+stays name\-only: it is what
+.B restore
+validates its argument against.
+.TP
+.B restore " \fIts\fR [\-\-to\-root] [\-\-force] | \-\-local \fIfile\fR"
+Fetch, verify and extract a kit. By default it extracts to a staging directory for inspection and
+your running system is untouched.
+.B \-\-to\-root
+extracts straight to
+.I /
+for a bare\-metal restore.
+.B \-\-force
+is required to restore a kit older than the newest one recorded, which is otherwise refused as a
+rollback.
+.TP
+.B verify " \fIfile\fR | \fB\-\-remote\fR [\fIts\fR] | \fB\-\-all\fR"
+Check a kit end to end: checksum, signature, decryption and archive integrity.
+.I file
+is a kit already on this disk.
+.B \-\-remote
+fetches one from the remote first \(em the newest unless
+.I ts
+names another \(em and
+.B \-\-all
+does every kit there, one at a time so the whole remote is never on local disk at once. A sweep
+does not stop at the first bad kit: it reports how many of how many verified and names the ones
+that did not, because once one has failed the only useful question is how many others did.
+Distinct from
+.BR recovery\-drill ,
+which proves the \fIescrowed\fR key against a kit; this proves the kits against the key installed
+here.
+.TP
+.B status " [\-\-json]"
+Report the live state: remote, kit count, last backup, key, escrow and last drill. Needs no root.
+.TP
+.B config
+Print every effective setting and which file it came from. Run this first whenever the tool and
+you disagree about how it is configured.
+.TP
+.B schedule " [\fIbackup\fR|\fIdrill\fR \fIon\fR|\fIoff\fR [\-\-at \fIOnCalendar\fR]]"
+With no arguments, report whether each timer is enabled, when it runs and when it runs next.
+Otherwise enable or disable it, optionally setting the schedule \(em
+.BR daily ,
+.BR monthly ,
+.BR "*-*-* 03:00:00" .
+An invalid calendar expression is refused rather than written: systemd does not reject one at
+enable time, it simply never fires the timer again, which for a backup is indistinguishable from
+working until the day you need a restore.
+The package enables and starts the backup, drill and capstone timers when it is installed, and
+an upgrade leaves each one as it was; the capstone is skipped on a machine without multipass.
+.TP
+.B recovery\-drill " [\fIkey\fR] [\fIts\fR]"
+Prove recovery actually works. Imports only the escrowed key into a throwaway keyring \(em the
+wiped\-OS scenario \(em fetches a real kit from the remote, and decrypts and authenticates it.
+Also sweeps every kit on the remote for signature validity and checks the remote against the
+recorded anchor for deletion or rollback.
+.TP
+.B demo
+Self\-test the whole crypto and fidelity pipeline offline in a throwaway keyring, including a
+forged\-kit refusal. No root, no network.
+.TP
+.B escrow\-doc " [\fIoutfile\fR]"
+Write a printable recovery sheet holding the secret key, the signing public key and the manual
+recovery steps. Refuses to write anywhere inside the backup set.
+.TP
+.B escrow\-confirm
+Record that the key is safely escrowed off this machine. Clears the backup warning.
+.TP
+.B harden
+Delete the on\-box secret key and shred the on\-box escrow file, leaving the machine able to
+encrypt but never decrypt. Irreversible, and gated on proving an off\-box copy exists first.
+.TP
+.B break\-glass " \fIfile\fR [\fItarget\fR]"
+Print, and then run, the raw
+.BR gpg / zstd / tar
+recovery steps \(em recovery when
+.B timecrate
+itself is not available.
+.TP
+.B remote " \fIsubcommand\fR"
+Manage where the backups go. Needs no privileges.
+.RS
+.TP
+.B status " [\fB\-\-json\fR]"
+Path, backend, account, token expiry and whether the remote is reachable right now. Never prints
+the token itself.
+.TP
+.B connect " [\fB\-\-provider\fR \fIname\fR] [\fB\-\-reauthorize\fR]"
+Run the provider's authorisation and store it in rclone's config. Detects a session with no
+browser and prints the \fBrclone authorize\fR half of the dance instead of hanging.
+.TP
+.B test
+Prove the remote both lists and accepts writes, and name the reason when it does not: a missing
+path, a rejected token, an unknown rclone remote and a read-only destination are four different
+faults.
+.TP
+.B browse " [\fIremote:path\fR] [\fB\-\-json\fR]"
+One level of folders, for choosing one.
+.TP
+.B mkdir " \fIremote:path\fR"
+.TP
+.B set-path " \fIremote:path\fR [\fB\-\-yes\fR]"
+Repoint future backups. Prints the backup count at both ends first and warns when the current path
+holds backups the new one does not; they are neither moved nor deleted. The previous configuration
+is kept alongside as \fI.bak\fR.
+.TP
+.B disconnect " [\fB\-\-remove\-rclone\-remote\fR] [\fB\-\-yes\fR]"
+Forget the remote on this machine. Does not touch the backups and does not revoke access at the
+provider.
+.RE
+.TP
+.B keys " [\fB\-\-json\fR]\"
+Report the encryption and signing keys, whether each secret half is present on this machine, and
+whether the escrow has been confirmed \(em and for which key. Needs no privileges.
+.TP
+.B import\-key " \fIfile\fR|\fB\-\fR [\fB\-\-signing\-pub\fR \fIfile\fR] [\fB\-\-replace\fR] [\fB\-\-yes\fR] [\fB\-\-dry\-run\fR]"
+Import an escrowed secret key onto a rebuilt machine. The key is validated in a throwaway keyring
+before the real one is touched: it must be RSA on its encryption\-capable part, carry a secret
+half, and not be expired or revoked.
+.B \-\-dry\-run
+validates and reports the fingerprint without importing.
+.B \-\-replace
+re\-points new backups at the imported key while keeping the superseded secret, so archives
+encrypted to it stay readable.
+.TP
+.B verify\-key " [\fB\-\-deep\fR]"
+Answer whether \fIthis\fR machine can read the newest archive on the remote, by matching its
+recipient key\-id against the local keyring.
+.B \-\-deep
+fetches and fully decrypts it, with signature verification mandatory. Distinct from
+.BR "recovery\-drill" ,
+which proves the \fIescrowed\fR copy works: a reinstalled machine can pass that and still be
+unable to restore.
+.TP
+.B export\-key " [\fB\-\-out\fR \fIfile\fR]"
+Write the secret key out for escrow. Refuses any path inside the backup include set \(em escrowing
+the key into the archives it decrypts is the failure escrow exists to avoid.
+.TP
+.B paths " \fIinclude\fR|\fIexclude\fR [\fBlist\fR|\fBadd\fR \fIpath\fR|\fBremove\fR \fIpath\fR]"
+Show or change what a kit contains.
+.B list
+needs no privileges;
+.B add
+and
+.B remove
+edit root\-owned files in /etc and do. An absolute path is stored relative to \fI/\fR, and one
+under the configured user's home as \fI~/\fR so the list survives a username change. A path
+containing a newline or \fI..\fR is refused.
+.TP
+.B history " [\fB\-\-json\fR] [\fB\-n\fR \fIcount\fR]"
+What this machine has been doing: backups and drills, with size and duration where they were
+recorded. Lines written before v1.9.0 carry neither and report as not recorded rather than as zero.
+.TP
+.B alerts " [\fB\-\-json\fR]"
+Whether a failed backup or drill would reach anyone: which command it runs, or that it is written
+to the journal only. The command may be set in the root\-only secrets file, so an unprivileged run
+that cannot read it reports that it cannot tell rather than that nothing is configured.
+.TP
+.B alerts test
+Send a real alert down the same path, and at the same severity, as a failure. Needs root.
+.SH CONFIGURATION
+Settings are read from four sources. Strongest first:
+.IP 1. 4
+The environment \(em
+.B TIMECRATE_REMOTE=... timecrate list
+.IP 2. 4
+.I ~/.config/timecrate/timecrate.conf
+.IP 3. 4
+.I /etc/timecrate.env
+\(em mode 0600, root only, for secrets
+.IP 4. 4
+.I /etc/timecrate/timecrate.conf
+.PP
+Every entry point reads all four, including the systemd timers and the GUI. Each setting is a
+shell assignment named
+.BI TIMECRATE_ NAME\fR.
+.B timecrate config
+prints the resolved values with their source.
+.SH ALERTS
+A failed backup, drill or capstone is always written to the system journal. To be told anywhere
+else, set
+.B TIMECRATE_ALERT_CMD
+to an executable. Every alert runs it as
+.PP
+.RS
+.I command severity title key
+.RE
+.PP
+with the message on standard input.
+.I severity
+is
+.BR critical ,
+.B warn
+or
+.BR info ;
+.I title
+is one line;
+.I key
+names the kind of alert
+.RB ( backup ", " remote ", " drill ", " capstone ", " overnight ", " unit\-\fIname\fR, " test )
+so a receiver can update one message in place instead of adding another. It runs as root, with
+.I /etc/timecrate.env
+in its environment \(em the place for any token it needs. Exit status 0 means delivered; anything
+else is reported as a failed delivery, and makes
+.B alerts test
+fail. A wrapper script is the way to pass arguments.
+.SH OFF\-BOX ESCROW
+.B TIMECRATE_ESCROW_KEY_CMD
+names an executable that prints the escrowed secret key, ASCII\-armored, on standard output \(em
+from a password manager's command\-line tool or a secret store. It runs as root with
+.I /etc/timecrate.env
+in its environment. The monthly drill decrypts with the key it prints, which proves the copy that
+survives a wiped machine rather than the one on it, and
+.B harden
+compares its fingerprint before shredding anything.
+.B TIMECRATE_ESCROW_SSH
+is the other route: a host holding a copy of the escrow file, compared by hash.
+.SH KITS FROM EARLIER VERSIONS
+Releases before 3.0.0 named kits
+.IR timemachine\-<timestamp>.tar.zst.gpg ,
+with a
+.I TIMEMACHINE\-MANIFESTS
+directory inside. Every command reads them: they are listed, verified, restored, drilled and
+pruned together with
+.I timecrate\-*
+kits, as one series ordered by timestamp. Nothing needs renaming. See
+.I MIGRATING.md
+for moving a machine from the previous package names.
+.SH SAFETY RAILS
+.TP
+.B Size cap and floor
+A kit larger than
+.B TIMECRATE_MAX_MB
+means an include went wrong; one smaller than
+.B TIMECRATE_MIN_MB
+means the include set collapsed and the kit is hollow. Either refuses to ship, because a hollow
+kit would upload clean and then age out the real ones.
+.TP
+.B Signature before extraction
+Kits are materialised and verified before anything is extracted, never streamed through
+.BR tar .
+.TP
+.B Anti\-rollback
+Each upload records the expected newest kit and count. Restoring anything older needs
+.BR \-\-force ,
+and the backup and drill both alert on unexpected deletion or rollback on the remote \(em an old
+kit carries a perfectly valid signature, so signing alone cannot catch this.
+.TP
+.B Automatic exclusions
+The keyring and escrow file, the rclone token and the staging directory are excluded from every
+kit, derived from live configuration. Editing the exclude file cannot re\-admit them.
+.SH FILES
+.TP
+.I /etc/timecrate/timecrate.conf
+System configuration.
+.TP
+.I /etc/timecrate/include
+Paths that make up the kit, relative to
+.IR / .
+.B ~/
+expands to the configured user's home.
+.TP
+.I /etc/timecrate/exclude
+Patterns pruned from inside the included paths.
+.TP
+.I /etc/timecrate.env
+Root\-only secrets, mode 0600. The systemd units load it too.
+.TP
+.I ~/.config/timecrate/
+Keyring, escrow file and pinned signing fingerprint.
+.TP
+.I ~/.local/state/timecrate/status.json
+Machine\-readable status, consumed by
+.B status
+and the GUI. Fields are only ever added, never renamed or removed. Size fields
+.RB ( cloud_bytes ", " remote_quota_used ", " remote_quota_total ", " last_backup_bytes ", "
+.BR previous_backup_bytes )
+are strings, and an empty string means
+.I not measured
+\(em never zero, because a remote that could not be read and a remote that is genuinely empty
+must not render alike.
+.TP
+.I ~/.local/state/timecrate/log
+One line per run. A backup line is
+.IR "<iso\-timestamp> ok <kit\-timestamp> <filename> <bytes> <seconds>" .
+The last two fields were added in 1.9.0; lines written by older versions have four fields and
+are read as \(lqsize not recorded\(rq. A
+.B \-
+in either position means this run could not measure it.
+.SH EXIT STATUS
+Zero on success. Any failure exits non\-zero with a line prefixed
+.BR [timecrate][ERROR] .
+Warnings that do not stop the run are prefixed
+.BR [timecrate][WARN] .
+.SH SEE ALSO
+.BR timecrate\-gui (1),
+.BR rclone (1),
+.BR gpg (1),
+.BR zstd (1),
+.BR tar (1)
+.PP
+.IR RESTORE.md ,
+.I BREAK\-GLASS.md
+and
+.I MIGRATING.md
+in
+.IR /usr/share/doc/timecrate/ ,
+and https://github.com/spencercnorton/timecrate
+.SH BUGS
+The disaster this tool exists for is the one you cannot rehearse by reading. Run
+.B recovery\-drill
+on a schedule and treat a failure as an outage.

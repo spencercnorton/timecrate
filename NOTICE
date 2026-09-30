@@ -1,0 +1,20 @@
+Timecrate — provenance and licence
+https://github.com/spencercnorton/timecrate
+
+Origin
+------
+Original work, not a fork. It was developed alongside a fork of Timeshift
+(https://github.com/linuxmint/timeshift) and shares no code with it; it is not
+affiliated with Linux Mint. Releases before 3.0.0 were distributed as the
+time-machine and time-machine-gui packages.
+
+Artwork
+-------
+The icon, gui/dev.norvi.Timecrate.svg, was drawn for this project and is
+licensed with the rest of the repository.
+
+Licence
+-------
+All files are licensed under the GNU General Public License, version 2 or (at
+your option) any later version. The full licence text is in LICENSE.
+Copyright 2026 Spencer Norton.

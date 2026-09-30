@@ -1,0 +1,40 @@
+#!/usr/bin/make -f
+
+# Nothing here is compiled: the engine is a bash script and the front-end is Python.
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_install:
+	# --- engine ---
+	install -D -m 0755 timecrate         debian/timecrate/usr/bin/timecrate
+	install -D -m 0644 timecrate.conf    debian/timecrate/etc/timecrate/timecrate.conf
+	install -D -m 0644 timecrate.include debian/timecrate/etc/timecrate/include
+	install -D -m 0644 timecrate.exclude debian/timecrate/etc/timecrate/exclude
+	# --- what the units run ---
+	for f in backup-and-alert.sh drill-and-alert.sh capstone-and-alert.sh overnight-suite.sh alert.sh; do \
+	  install -D -m 0755 "deploy/$$f" "debian/timecrate/usr/libexec/timecrate/$$f"; \
+	done
+	# recover-in-vm.sh runs INSIDE the capstone's guest, not on this host: it is data here, and
+	# /usr/share is where capstone-and-alert.sh looks for it.
+	install -D -m 0755 deploy/recover-in-vm.sh debian/timecrate/usr/share/timecrate/recover-in-vm.sh
+	for u in deploy/*.service deploy/*.timer; do \
+	  install -D -m 0644 "$$u" "debian/timecrate/usr/lib/systemd/system/$$(basename "$$u")"; \
+	done
+	# --- front-end ---
+	install -D -m 0755 gui/timecrate-gui debian/timecrate-gui/usr/bin/timecrate-gui
+	install -D -m 0644 gui/dev.norvi.Timecrate.desktop \
+	  debian/timecrate-gui/usr/share/applications/dev.norvi.Timecrate.desktop
+	install -D -m 0644 gui/dev.norvi.Timecrate.svg \
+	  debian/timecrate-gui/usr/share/icons/hicolor/scalable/apps/dev.norvi.Timecrate.svg
+	install -D -m 0644 gui/dev.norvi.Timecrate.policy \
+	  debian/timecrate-gui/usr/share/polkit-1/actions/dev.norvi.Timecrate.policy
+
+# The timers are enabled and started when the package is installed, and an upgrade must never
+# disarm them. --restart-after-upgrade is what guarantees the second half: without it, a package
+# built with --no-start gets a preinst that stops every unit on upgrade and nothing that starts
+# them again -- an `apt upgrade` that silently ends the nightly backup. With it, preinst stops
+# nothing and postinst restarts the timers that are enabled. A timer an administrator disabled
+# stays disabled. The services are static (no [Install]), so nothing starts them here, and a
+# backup running during an upgrade is left to finish.
+override_dh_installsystemd:
+	dh_installsystemd --restart-after-upgrade

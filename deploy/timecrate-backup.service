@@ -1,0 +1,26 @@
+[Unit]
+Description=Timecrate backup (compress, encrypt and upload to the cloud remote)
+Documentation=man:timecrate(1)
+After=network-online.target
+Wants=network-online.target
+# unit-level death (timeout, OOM, segfault) means the in-script alert never ran; this is a
+# separate path that does not go through the engine
+OnFailure=timecrate-alert@%n.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# a hung run would otherwise hold the oneshot active forever and silently suppress every
+# future timer tick
+TimeoutStartSec=4h
+# Optional ('-'): a missing secrets file must degrade alerting, never stop the backup itself.
+EnvironmentFile=-/etc/timecrate.env
+# sandbox — a root unit parsing cloud-fetched data. Deliberately NOT set: ProtectHome (reads
+# /home) and NoNewPrivileges (uses sudo -u for the user-context manifests).
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ExecStart=/usr/libexec/timecrate/backup-and-alert.sh

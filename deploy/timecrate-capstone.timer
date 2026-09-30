@@ -1,0 +1,14 @@
+[Unit]
+Description=Quarterly Timecrate boot-and-verify capstone
+Documentation=man:timecrate(1)
+
+[Timer]
+# Quarterly, not monthly: it launches a VM and installs thousands of packages. The monthly drill
+# covers "are the kits readable"; this covers "can a machine be rebuilt from one", which changes
+# far less often — but which stayed broken for twelve releases when nothing ran it at all.
+OnCalendar=quarterly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,2621 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright 2026 Spencer Norton
+"""Timecrate - GTK4/libadwaita front-end for the `timecrate` backup tool.
+
+A front-end only. Every operation is carried out by the CLI, whose output is shown verbatim in
+the activity log, and both read the same configuration. Nothing here can do anything the command
+line cannot, which is deliberate: a machine with no graphical session must lose no capability.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import tempfile
+from datetime import datetime
+
+# The default GTK4 renderer crashes on some Nvidia + Wayland systems; GL works everywhere this runs.
+os.environ.setdefault("GSK_RENDERER", "gl")
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+TC = shutil.which("timecrate") or "/usr/bin/timecrate"
+APP_ID = "dev.norvi.Timecrate"
+
+# Kits written before 3.0.0 carry the previous name; they are the same series.
+KIT_RE = re.compile(r"(?:timecrate|timemachine)-(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.tar\.zst\.gpg$")
+# `restore` ends with: inspect <dir>/extracted ; RESTORE.md in /usr/share/doc/timecrate ...
+STAGED_RE = re.compile(r"inspect\s+(\S+/extracted)\b")
+# run_async merges stderr into stdout, so `import-key --dry-run`'s fingerprint is identified
+# by shape rather than by position.
+FPR_RE = re.compile(r"^[0-9A-F]{40}$")
+# pkexec's own exit codes: 126 = the user dismissed the authentication dialog, 127 = not authorised.
+PKEXEC_CANCELLED, PKEXEC_NOT_AUTHORISED = 126, 127
+# How far a kit may differ from the one before it before the row says so. Backups of a machine's
+# configuration are near-identical night to night, so a third is already a real event -- either
+# something large arrived in the include set, or something large fell out of it.
+KIT_DEVIATION = 0.33
+
+
+def human_bytes(value):
+    """Bytes as a short string. '' or None is 'unknown' -- never '0 B'."""
+    if value in ("", None):
+        return "unknown"
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%d B" % n if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024
+
+MILESTONES = {
+    "backup": [
+        # The size guard tars the whole include set before anything else prints, which on a real
+        # box is most of the run. Claiming "waiting for administrator approval" through all of it
+        # was the most misleading thing this window used to say.
+        ("staged (uncompressed) size", "Measured the backup size", 0.30),
+        ("generating manifests", "Recording installed packages and settings", 0.38),
+        ("archive (tar full-fidelity)", "Archiving, compressing and encrypting", 0.55),
+        ("uploading to", "Uploading to the remote", 0.72),
+        ("mirroring to", "Mirroring to the second remote", 0.80),
+        ("uploaded + verified", "Upload verified", 0.92),
+        ("kept local (no upload)", "Archive kept locally", 0.92),
+        ("backup complete.", "Backup complete", 1.0),
+    ],
+    "dry-run": [
+        ("staged (uncompressed) size", "Measuring", 0.60),
+        ("DRY RUN", "Previewing what would be backed up", 0.40),
+    ],
+    "recovery-drill": [
+        ("importing ONLY the escrowed key", "Importing only the escrowed key", 0.15),
+        ("fetching kit", "Fetching the newest archive", 0.35),
+        ("decrypting with ONLY the escrowed key", "Decrypting with the escrowed key alone", 0.55),
+        ("remote sweep:", "Verifying every archive on the remote", 0.85),
+        ("RECOVERY DRILL PASSED", "Recovery drill passed", 1.0),
+        ("RECOVERY DRILL FAILED", "Recovery drill failed", 1.0),
+    ],
+    "restore": [
+        ("fetching", "Fetching the selected archive", 0.25),
+        ("decrypt + signature verification", "Verifying the signature", 0.55),
+        ("decompress", "Decrypting and extracting to staging", 0.80),
+        ("done.", "Restore staged for inspection", 1.0),
+    ],
+    "schedule": [],
+    "escrow-confirm": [],
+    "paths": [],
+    "alerts": [],
+}
+
+# Settings this window may write, as (TIMECRATE_ name, status.json key). Deliberately not
+# TIMECRATE_USER: that is what locates the per-user config file being written, so setting it
+# here could only ever point the tool at a file it would then stop reading.
+#
+# TIMECRATE_REMOTE2 is deliberately absent. The engine still mirrors to a second remote and
+# still honours the setting; the window stopped offering a free-text field for a feature nobody
+# here has a second provider for, and offering it was how it read as configured-but-broken.
+# write_user_config only touches the keys it is handed, so an existing REMOTE2 line survives.
+# TIMECRATE_REMOTE is deliberately absent too, for a sharper reason: this dialog writes every
+# row below on close, using the values it read when it opened. Listing the destination here made
+# closing the window silently revert a folder change made on the Remote page.
+SETTINGS = [
+    ("TIMECRATE_GIT_WATCH", "git_watch"),
+    ("TIMECRATE_KEEP", "keep"),
+    ("TIMECRATE_KEEP_MONTHLY", "keep_monthly"),
+    ("TIMECRATE_KEEP_YEARLY", "keep_yearly"),
+    ("TIMECRATE_MIN_MB", "min_mb"),
+    ("TIMECRATE_MAX_MB", "max_mb"),
+    ("TIMECRATE_ZSTD_LEVEL", "zstd_level"),
+]
+TEXT_SETTINGS = {"TIMECRATE_GIT_WATCH"}   # everything else here is numeric
+
+# Pill colours, per scheme, with the contrast each pair measures against that scheme's window
+# background. GTK4 CSS cannot branch on the colour scheme, so the app reloads these when it
+# changes. Do not "tidy" these into one set: the light foregrounds measure 1.36–1.61:1 on a dark
+# background, which is how they shipped and why they were unreadable.
+PILL_LIGHT = {                      # success 5.27:1   warning 5.96:1   error 5.55:1
+    "success_fg": "#0b6e38", "success_bg": "#2ec27e",
+    "warning_fg": "#8a4b00", "warning_bg": "#f5c211",
+    "error_fg":   "#a51d2d", "error_bg":   "#ed333b",
+    "alpha": "0.18",
+}
+PILL_DARK = {                       # success 7.39:1   warning 6.77:1   error 6.52:1
+    "success_fg": "#8ff0b8", "success_bg": "#2ec27e",
+    "warning_fg": "#ffd96b", "warning_bg": "#f5c211",
+    "error_fg":   "#ffa8a8", "error_bg":   "#ed333b",
+    "alpha": "0.18",
+}
+
+# systemd stores a calendar in its normalised form, so a timer set to `monthly` reads back as
+# `*-*-01 00:00:00`. Without this the Schedule tab silently mis-reports what is configured —
+# the same class of lie as a green "0 KITS".
+CALENDAR_ALIASES = {
+    "hourly": "*-*-* *:00:00",
+    "daily": "*-*-* 00:00:00",
+    "weekly": "Mon *-*-* 00:00:00",
+    "monthly": "*-*-01 00:00:00",
+    "yearly": "*-01-01 00:00:00",
+    "annually": "*-01-01 00:00:00",
+}
+
+
+def same_calendar(a, b):
+    a, b = a.strip(), b.strip()
+    return CALENDAR_ALIASES.get(a, a) == CALENDAR_ALIASES.get(b, b)
+
+
+def user_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(GLib.get_home_dir(), ".config")
+    return os.path.join(base, "timecrate", "timecrate.conf")
+
+
+def write_user_config(values):
+    """Merge `values` into the per-user config, preserving whatever else is in it.
+
+    The per-user file, not /etc: it needs no root, and the engine reads it at every entry point,
+    because it resolves it from the account it is acting for rather than from $HOME.
+
+    Which is why the pkexec resolution bug fixed in 2.6.0 reached here too: this window is
+    unprivileged, so it wrote to the invoking user's home, while the engine it then called under
+    pkexec resolved the account to root and read /root/.config instead. On a box that had not
+    pinned TIMECRATE_USER, every setting changed in this dialog was silently ignored by every
+    privileged operation. The root-run timers still need TIMECRATE_USER pinned to find this
+    file — there is no invoking user for them to be inferred from.
+    """
+    path = user_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        lines = [
+            "# Timecrate - per-user settings, written by the Timecrate settings window.",
+            "# Overrides /etc/timecrate/timecrate.conf; the environment still wins over both.",
+            "# `timecrate config` shows what is actually in effect.",
+        ]
+
+    for name, value in values.items():
+        # shlex.quote because this file is sourced by the engine: an unquoted remote with a space
+        # in it would be a syntax error that the next backup reports as something else entirely.
+        entry = "%s=%s" % (name, shlex.quote(str(value)))
+        pattern = re.compile(r"^\s*(?:export\s+)?%s=" % re.escape(name))
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                lines[i] = entry
+                break
+        else:
+            lines.append(entry)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def run_async(argv, on_done):
+    """Run a command off the main loop. Calls on_done(ok, output).
+
+    Everything this window renders comes through here. It used to be two blocking subprocess.run
+    calls with 40-second timeouts, on the GTK main loop - so a slow remote froze the entire
+    window for up to eighty seconds with no way to tell that from a crash.
+    """
+    try:
+        proc = Gio.Subprocess.new(
+            argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+    except GLib.Error as exc:
+        GLib.idle_add(on_done, False, exc.message)
+        return
+
+    def finished(process, result):
+        try:
+            _ok, out, _err = process.communicate_utf8_finish(result)
+            on_done(process.get_successful(), out or "")
+        except GLib.Error as exc:
+            on_done(False, exc.message)
+
+    proc.communicate_utf8_async(None, None, finished)
+
+
+class KitRow(Adw.ActionRow):
+    def __init__(self, filename, display, on_restore, size="", deviation=None):
+        if size not in ("", None):
+            display = "%s  —  %s" % (display, human_bytes(size))
+        super().__init__(title=display, subtitle=filename)
+        self.filename = filename
+        self.add_prefix(Gtk.Image.new_from_icon_name("document-save-symbolic"))
+
+        # A kit that suddenly halves is the shape of an include set that quietly collapsed; one
+        # that doubles is the shape of something bulky wandering in. Both pass every check the
+        # engine makes -- the size rails only catch the extremes -- so the list says it out loud.
+        self.deviation = deviation
+        self.flagged = deviation is not None and abs(deviation) >= KIT_DEVIATION
+        if self.flagged:
+            mark = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+            mark.set_tooltip_text(
+                "%+.0f%% versus the backup before it. Worth a look if nothing on this machine "
+                "changed by that much." % (deviation * 100))
+            mark.update_property([Gtk.AccessibleProperty.LABEL],
+                                 ["Size changed %+.0f%% from the previous backup"
+                                  % (deviation * 100)])
+            self.add_suffix(mark)
+
+        button = Gtk.Button(label="Restore…")
+        button.set_valign(Gtk.Align.CENTER)
+        button.add_css_class("suggested-action")
+        button.update_property([Gtk.AccessibleProperty.LABEL],
+                               ["Restore the backup from %s" % display])
+        button.connect("clicked", lambda *_: on_restore(filename))
+        self.restore_button = button
+        self.add_suffix(button)
+
+    def set_busy(self, busy):
+        self.restore_button.set_sensitive(not busy)
+
+
+class SettingsDialog(Adw.PreferencesDialog):
+    """Edits the per-user config file the engine already reads. No root, no separate store."""
+
+    def __init__(self, window, status):
+        super().__init__(title="Timecrate Settings")
+        self.window = window
+        self.rows = {}
+        self._schedule_baseline = {}
+
+        self.remote_page = RemotePage(window)      # built first: the Backup page links to it
+
+        page = Adw.PreferencesPage(title="Backup", icon_name="drive-harddisk-symbolic")
+        self.add(page)
+
+        # The destination is owned by the Remote page, and by ONLY that page. It used to be a text
+        # entry here as well, which meant two writers for one setting: this dialog saves every row
+        # on close from the values it read when it OPENED, so changing the folder on the Remote
+        # page and then closing the window wrote the old path straight back over it. The change
+        # appeared to work and then silently undid itself.
+        dest = Adw.PreferencesGroup(title="Destination")
+        page.add(dest)
+        where = Adw.ActionRow(title="Where backups go",
+                              subtitle=status.get("remote", "") or "not set")
+        where.set_subtitle_selectable(True)
+        go = Gtk.Button(label="Remote page", valign=Gtk.Align.CENTER)
+        go.connect("clicked", lambda *_: self.set_visible_page(self.remote_page))
+        where.add_suffix(go)
+        dest.add(where)
+        if status.get("remote2"):
+            mirror = Adw.ActionRow(title="Second remote", subtitle=status.get("remote2", ""))
+            mirror.set_subtitle_selectable(True)
+            dest.add(mirror)
+
+        keep = Adw.PreferencesGroup(
+            title="Retention",
+            description="Beyond the daily window, the first backup of each month and of each "
+                        "year survives. Applied to every remote.")
+        page.add(keep)
+        self.rows["TIMECRATE_KEEP"] = self._spin(keep, "Daily backups kept", status.get("keep", 14), 1, 365)
+        self.rows["TIMECRATE_KEEP_MONTHLY"] = self._spin(keep, "Monthly kept", status.get("keep_monthly", 12), 0, 120)
+        self.rows["TIMECRATE_KEEP_YEARLY"] = self._spin(keep, "Yearly kept", status.get("keep_yearly", 3), 0, 50)
+
+        rails = Adw.PreferencesGroup(
+            title="Safety rails",
+            description="A backup bigger than the cap means something was included by mistake; "
+                        "one smaller than the floor means the include list collapsed. Either "
+                        "refuses to upload rather than quietly replacing good backups with bad.")
+        page.add(rails)
+        self.rows["TIMECRATE_MIN_MB"] = self._spin(rails, "Refuse below (MB)", status.get("min_mb", 25), 0, 100000)
+        self.rows["TIMECRATE_MAX_MB"] = self._spin(rails, "Refuse above (MB)", status.get("max_mb", 2000), 1, 1000000)
+        self.rows["TIMECRATE_ZSTD_LEVEL"] = self._spin(
+            rails, "Compression level", status.get("zstd_level", 19), 1, 22,
+            "Higher is smaller and slower. 19 is a good default.")
+
+        contents = Adw.PreferencesGroup(
+            title="What gets backed up",
+            description="Edited as files, because a list of paths is a file and pretending "
+                        "otherwise helps nobody.")
+        page.add(contents)
+        # These used to be "open the file in your editor" buttons. The files are root-owned, this
+        # window is not root, so that produced a read-only buffer and an error on save — a button
+        # that could not do the thing it offered. They are edited here now, through the same
+        # privileged binary as everything else.
+        for label, which, key in (("Included paths", "include", "include_file"),
+                                  ("Excluded paths", "exclude", "exclude_file")):
+            row = Adw.ActionRow(title=label, subtitle=status.get(key) or "")
+            row.set_subtitle_selectable(True)
+            btn = Gtk.Button(label="Edit…", valign=Gtk.Align.CENTER)
+            btn.connect("clicked", lambda _b, w=which: PathsEditor(
+                window, w, lambda: window.refresh()).present(window))
+            row.add_suffix(btn)
+            contents.add(row)
+
+        # The lists say what was asked for; this says what that actually means on THIS disk —
+        # including the paths neither list mentions, which are the ones that go missing quietly.
+        cov = Adw.ActionRow(title="Coverage",
+                            subtitle="What is backed up, what is pruned, and what nothing covers")
+        cov_btn = Gtk.Button(label="Show…", valign=Gtk.Align.CENTER)
+        cov_btn.connect("clicked", lambda *_: CoverageDialog(window).present(window))
+        cov.add_suffix(cov_btn)
+        contents.add(cov)
+
+        # The kit carries a repository's working tree but not its .git, so a commit that exists
+        # only locally is the one thing a "successful" backup silently does not save. The engine
+        # warns per repository at backup time; until now the list it warns about could only be
+        # set by hand-editing a config file.
+        self.rows["TIMECRATE_GIT_WATCH"] = self._entry(
+            contents, "Watch for unpushed commits", status.get("git_watch", ""),
+            "Space-separated repository paths. Before each backup the engine warns, by name, "
+            "about any that have commits you have not pushed — the kit backs up the working "
+            "tree, not .git.")
+
+        self.add(self.remote_page)
+
+        self.keys_page = KeysPage(window)
+        self.add(self.keys_page)
+
+        sched = Adw.PreferencesPage(title="Schedule", icon_name="alarm-symbolic")
+        self.add(sched)
+        group = Adw.PreferencesGroup(
+            title="Automatic runs",
+            description="These are systemd timers, so changing them asks for administrator "
+                        "approval when you close this window.")
+        sched.add(group)
+        self.schedule_rows = {}
+        for unit, title, subtitle, choices in (
+            ("backup", "Back up", "How often a new encrypted archive is made and uploaded.",
+             [("daily", "Daily"), ("*-*-* 03:00:00", "Daily at 03:00"),
+              ("weekly", "Weekly"), ("hourly", "Hourly")]),
+            ("drill", "Recovery drill",
+             "Proves the escrowed key still decrypts a real archive. A backup that has never "
+             "been restored is a hypothesis.",
+             [("monthly", "Monthly"), ("weekly", "Weekly"), ("daily", "Daily")]),
+        ):
+            row = Adw.ComboRow(title=title, subtitle=subtitle)
+            model = Gtk.StringList()
+            model.append("Off")
+            for _value, label in choices:
+                model.append(label)
+            row.set_model(model)
+            row.set_selected(0)
+            group.add(row)
+            self.schedule_rows[unit] = (row, choices)
+
+        self.schedule_note = Adw.ActionRow(title="Reading the current schedule…", subtitle="")
+        self.schedule_note.set_subtitle_selectable(True)
+        group.add(self.schedule_note)
+        self._load_schedule()
+
+        alerts = Adw.PreferencesGroup(
+            title="If something goes wrong",
+            description="A failed backup or drill sends a message. An alert path that is only "
+                        "ever exercised by a real failure is one nobody knows is broken.")
+        sched.add(alerts)
+        self.alert_row = Adw.ActionRow(title="Failure alerts", subtitle="…")
+        self.alert_row.set_subtitle_selectable(True)
+        test = Gtk.Button(label="Send a test", valign=Gtk.Align.CENTER)
+        test.connect("clicked", lambda *_: self._test_alert())
+        self.alert_row.add_suffix(test)
+        alerts.add(self.alert_row)
+        self._load_alerts()
+
+        about = Adw.PreferencesGroup(title="Configuration files")
+        sched.add(about)
+        sources = status.get("conf_sources") or []
+        row = Adw.ActionRow(
+            title="In effect",
+            subtitle="\n".join(sources) if sources
+            else "None — the tool is running entirely on its built-in defaults.")
+        row.set_subtitle_selectable(True)
+        about.add(row)
+        written = Adw.ActionRow(
+            title="Changes here are written to",
+            subtitle="%s\nIt overrides the system file. `timecrate config` shows what wins."
+                     % user_config_path())
+        written.set_subtitle_selectable(True)
+        about.add(written)
+
+        # what the rows held when this window opened; only differences are written back
+        self._baseline = self._read_rows()
+        self.connect("closed", lambda *_: self._save())
+
+    def _load_alerts(self):
+        def done(ok, out):
+            if not ok:
+                self.alert_row.set_subtitle("could not check")
+                return
+            try:
+                d = json.loads(out)
+            except ValueError:
+                return
+            if not d.get("readable"):
+                # the command may be set in a root-only file, so an unprivileged read cannot tell
+                self.alert_row.set_subtitle(
+                    "cannot tell from here — it may be set in %s, which only root can read"
+                    % (d.get("secrets_file") or "the secrets file"))
+            elif d.get("configured") is True:
+                # what a FAILURE runs, which is the thing worth showing
+                self.alert_row.set_subtitle(
+                    "configured — a failure runs %s (%s)"
+                    % (d.get("command") or "?", d.get("severity") or "?"))
+            else:
+                self.alert_row.set_subtitle(
+                    "journal only — a failure is written to the system journal and sent nowhere else")
+
+        run_async([TC, "alerts", "--json"], done)
+
+    def _test_alert(self):
+        dialog = Adw.AlertDialog(
+            heading="Send a test alert?",
+            body="This sends a real message down the same path a failed backup would use, so you "
+                 "find out now rather than during an outage.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("send", "Send it")
+        dialog.set_response_appearance("send", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: self.window.queue_privileged(
+            ["alerts", "test"], on_finished=self._load_alerts) if r == "send" else None)
+        dialog.present(self)
+
+    def _entry(self, group, title, value, tooltip):
+        row = Adw.EntryRow(title=title)
+        row.set_text(str(value or ""))
+        if tooltip:
+            row.set_tooltip_text(tooltip)
+        group.add(row)
+        return row
+
+    def _spin(self, group, title, value, low, high, subtitle=None):
+        row = Adw.SpinRow.new_with_range(low, high, 1)
+        row.set_title(title)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        try:
+            row.set_value(float(value))
+        except (TypeError, ValueError):
+            pass
+        group.add(row)
+        return row
+
+    def _load_schedule(self):
+        def done(ok, out):
+            if not ok:
+                self.schedule_note.set_title("Could not read the current schedule")
+                self.schedule_note.set_subtitle(
+                    out.strip().splitlines()[-1] if out.strip() else "")
+                return
+            self.schedule_note.set_title("Currently")
+            self.schedule_note.set_subtitle(out.strip())
+            # `schedule` prints: "  <unit> <enabled|disabled> <OnCalendar…> next: <when>"
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 2 or parts[0] not in self.schedule_rows:
+                    continue
+                row, choices = self.schedule_rows[parts[0]]
+                if parts[1] != "enabled":
+                    row.set_selected(0)
+                    continue
+                calendar = " ".join(parts[2:]).split("next:")[0].strip()
+                for i, (value, _label) in enumerate(choices):
+                    if same_calendar(value, calendar):
+                        row.set_selected(i + 1)
+                        break
+                else:
+                    # Enabled on a calendar this window does not offer. Showing the first preset
+                    # here would state a schedule that is not the one running — `*-*-* 04:00:00`
+                    # displayed as "Daily" is the same misreporting this dialog exists to end.
+                    # Add the real value as its own option instead, so it is shown truthfully and
+                    # round-trips unchanged if the dialog is closed without touching it.
+                    choices.append((calendar, "Custom — %s" % calendar))
+                    row.get_model().append("Custom — %s" % calendar)
+                    row.set_selected(len(choices))
+            self._schedule_baseline = {u: r.get_selected() for u, (r, _c) in self.schedule_rows.items()}
+
+        run_async([TC, "schedule"], done)
+
+    def _read_rows(self):
+        values = {}
+        for name, _key in SETTINGS:
+            row = self.rows[name]
+            values[name] = row.get_text().strip() if name in TEXT_SETTINGS else int(row.get_value())
+        return values
+
+    def _save(self):
+        values = self._read_rows()
+        if values["TIMECRATE_MIN_MB"] >= values["TIMECRATE_MAX_MB"]:
+            self.window.report("Not saved: the size floor must be below the cap "
+                               "(%s is not below %s)." % (values["TIMECRATE_MIN_MB"],
+                                                          values["TIMECRATE_MAX_MB"]))
+            return
+        # ONLY what actually changed. Writing every row on close means this dialog re-asserts
+        # values it read when it opened, so anything altered elsewhere in the meantime gets
+        # stamped back over — which is exactly how closing the window used to undo a folder
+        # change made on the Remote page. Removing that setting fixed the instance; writing only
+        # the differences removes the whole class.
+        changed = {k: v for k, v in values.items() if v != self._baseline.get(k)}
+        if not changed:
+            return
+        try:
+            path = write_user_config(changed)
+        except OSError as exc:
+            self.window.report("Could not save settings: %s" % exc)
+            return
+        self._baseline = values
+        self.window.log_line("settings written to %s: %s" % (path, ", ".join(sorted(changed))))
+        self.window.toast("Settings saved")
+
+        # Timers are root-owned, so only send the ones actually changed: closing this dialog
+        # without touching the schedule must never raise an authentication prompt.
+        for unit, (row, choices) in self.schedule_rows.items():
+            selected = row.get_selected()
+            if not self._schedule_baseline or selected == self._schedule_baseline.get(unit):
+                continue
+            if selected == 0:
+                self.window.queue_privileged(["schedule", unit, "off"])
+            else:
+                self.window.queue_privileged(
+                    ["schedule", unit, "on", "--at", choices[selected - 1][0]])
+        self.window.refresh()
+
+
+class ImportKeyDialog(Adw.Dialog):
+    """Bring an escrowed key onto a rebuilt machine.
+
+    Two steps on purpose. `import-key --dry-run` validates the file and reports the fingerprint
+    without writing anything, so the operator confirms WHICH key they are about to trust before it
+    is trusted. Doing it in one step would mean either importing blind or asking the CLI's own
+    prompt, which reads /dev/tty and there is no tty here.
+    """
+
+    def __init__(self, window, on_done):
+        super().__init__(title="Import an escrowed key", content_width=560)
+        self.window, self.on_done = window, on_done
+        self.key_path = None
+        self.signing_path = None
+        self._temp = None
+
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            description="The secret key from your escrow — a file, or the armored text from the "
+                        "printed recovery sheet. It starts with BEGIN PGP PRIVATE KEY BLOCK.")
+        page.add(group)
+
+        self.file_row = Adw.ActionRow(title="Key file", subtitle="none chosen")
+        self.file_row.set_subtitle_selectable(True)
+        pick = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+        pick.connect("clicked", lambda *_: self._choose("key"))
+        self.file_row.add_suffix(pick)
+        group.add(self.file_row)
+
+        self.sign_row = Adw.ActionRow(
+            title="Signing public key",
+            subtitle="optional — without it a restore can decrypt but not authenticate")
+        self.sign_row.set_subtitle_selectable(True)
+        pick2 = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+        pick2.connect("clicked", lambda *_: self._choose("signing"))
+        self.sign_row.add_suffix(pick2)
+        group.add(self.sign_row)
+
+        paste = Adw.PreferencesGroup(title="…or paste it")
+        page.add(paste)
+        self.textview = Gtk.TextView(monospace=True, wrap_mode=Gtk.WrapMode.CHAR)
+        scroll = Gtk.ScrolledWindow(min_content_height=160)
+        scroll.set_child(self.textview)
+        scroll.add_css_class("card")
+        paste.add(scroll)
+
+        self.check = Gtk.Button(label="Check this key")
+        self.check.add_css_class("suggested-action")
+        self.check.connect("clicked", lambda *_: self._validate())
+        box = Gtk.Box(halign=Gtk.Align.END, spacing=8)
+        box.append(self.check)
+        paste.add(box)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(page)
+        self.set_child(view)
+
+    def _choose(self, which):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Signing public key" if which == "signing" else "Escrowed secret key")
+
+        def picked(source, result):
+            try:
+                path = source.open_finish(result).get_path()
+            except GLib.Error:
+                return                      # cancelled — not an error worth reporting
+            if which == "signing":
+                self.signing_path = path
+                self.sign_row.set_subtitle(path)
+            else:
+                self.key_path = path
+                self.file_row.set_subtitle(path)
+
+        dialog.open(self.window, None, picked)
+
+    def _source_path(self):
+        """The chosen file, or the pasted text written to a private temp file."""
+        if self.key_path:
+            return self.key_path
+        buf = self.textview.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        if not text:
+            return None
+        fd, path = tempfile.mkstemp(prefix="timecrate-import-", suffix=".asc")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        self._temp = path
+        return path
+
+    def _cleanup(self):
+        if self._temp:
+            try:
+                os.unlink(self._temp)
+            except OSError:
+                pass
+            self._temp = None
+
+    def _validate(self):
+        path = self._source_path()
+        if not path:
+            self.window.report("Choose a key file, or paste the armored key text.")
+            return
+        self.check.set_sensitive(False)
+
+        def done(ok, out):
+            self.check.set_sensitive(True)
+            if not ok:
+                self._cleanup()
+                # the CLI's refusals name the reason (public-only, non-RSA, expired); show it
+                self.window.report(self.window._clean(out.strip().splitlines()[-1])
+                                   if out.strip() else "Could not read that key.")
+                return
+            fpr = ""
+            for line in out.splitlines():
+                if FPR_RE.match(line.strip()):
+                    fpr = line.strip()
+                    break
+            if not fpr:
+                self._cleanup()
+                self.window.report("The key validated but reported no fingerprint.")
+                return
+            self._confirm(path, fpr)
+
+        run_async([TC, "import-key", path, "--dry-run"], done)
+
+    def _confirm(self, path, fpr):
+        pretty = " ".join(fpr[i:i + 4] for i in range(0, len(fpr), 4)) or "(unknown)"
+        dialog = Adw.AlertDialog(
+            heading="Import this key?",
+            body="Fingerprint\n%s\n\nCheck it against your escrow sheet. Backups made from now "
+                 "on will be encrypted to this key." % pretty)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("import", "Import")
+        dialog.set_response_appearance("import", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("import")
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response):
+            if response != "import":
+                self._cleanup()
+                return
+            args = [TC, "import-key", path, "--yes"]
+            if self.signing_path:
+                args += ["--signing-pub", self.signing_path]
+
+            def done(ok, out):
+                self._cleanup()
+                last = out.strip().splitlines()[-1] if out.strip() else ""
+                if ok:
+                    self.window.toast("Key imported")
+                    self.window.log_line("imported key %s" % fpr)
+                    self.close()
+                    self.on_done()
+                else:
+                    self.window.report(self.window._clean(last) or "Import failed.")
+
+            run_async(args, done)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
+
+
+class FolderPicker(Adw.Dialog):
+    """Walk the remote and choose a folder, instead of typing a path and hoping.
+
+    Every listing comes from `remote browse`, so this cannot show anything the command line
+    cannot. Choosing a folder does NOT commit: `set-path --dry-run` reports the backup count at
+    both ends first, because repointing away from a path that holds backups is how they become
+    invisible without anything being deleted.
+    """
+
+    def __init__(self, window, start, on_chosen):
+        super().__init__(title="Choose a folder", content_width=560, content_height=520)
+        self.window, self.on_chosen = window, on_chosen
+        self.path = start or ""
+        # Listings are async, so a fast enter-then-up leaves two in flight. Without this the
+        # slower reply appends its folders under the other folder's title, and clicking one builds
+        # a path relative to a directory it was never in.
+        self._seq = 0
+
+        self.header = Adw.HeaderBar()
+        self.up_button = Gtk.Button(icon_name="go-up-symbolic")
+        self.up_button.set_tooltip_text("Up one level")
+        self.up_button.connect("clicked", lambda *_: self._up())
+        self.header.pack_start(self.up_button)
+        new_button = Gtk.Button(icon_name="folder-new-symbolic")
+        new_button.set_tooltip_text("New folder here")
+        new_button.connect("clicked", lambda *_: self._new_folder())
+        self.header.pack_end(new_button)
+
+        self.page = Adw.PreferencesPage()
+        self.group = Adw.PreferencesGroup()
+        self.page.add(self.group)
+
+        self.choose = Gtk.Button(label="Use this folder")
+        self.choose.add_css_class("suggested-action")
+        self.choose.connect("clicked", lambda *_: self._confirm())
+        bar = Gtk.Box(halign=Gtk.Align.CENTER, spacing=8, margin_top=6, margin_bottom=12)
+        bar.append(self.choose)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(self.page)
+        box.append(bar)
+        view = Adw.ToolbarView()
+        view.add_top_bar(self.header)
+        view.set_content(box)
+        self.set_child(view)
+        self._load()
+
+    def _remote_name(self):
+        return self.path.split(":", 1)[0] if ":" in self.path else self.path
+
+    def _up(self):
+        name, _, rest = self.path.partition(":")
+        rest = rest.rstrip("/")
+        if "/" in rest:
+            self.path = "%s:%s" % (name, rest.rsplit("/", 1)[0])
+        else:
+            self.path = "%s:" % name
+        self._load()
+
+    def _load(self):
+        self.group.set_title(self.path or "(no remote)")
+        for row in list(self.rows()):
+            self.group.remove(row)
+        self.up_button.set_sensitive(":" in self.path and self.path.split(":", 1)[1].strip("/") != "")
+
+        self._seq += 1
+        seq = self._seq
+
+        def done(ok, out):
+            if seq != self._seq:
+                return                      # a later navigation already superseded this one
+            if not ok:
+                row = Adw.ActionRow(title="Could not list this folder",
+                                    subtitle=self.window._clean(out.strip().splitlines()[-1])
+                                    if out.strip() else "")
+                self.group.add(row)
+                return
+            try:
+                names = json.loads(out)
+            except ValueError:
+                names = []
+            if not names:
+                self.group.add(Adw.ActionRow(title="No folders here",
+                                             subtitle="You can still choose this one."))
+                return
+            for name in names:
+                row = Adw.ActionRow(title=name, activatable=True)
+                row.add_prefix(Gtk.Image.new_from_icon_name("folder-symbolic"))
+                row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                row.connect("activated", lambda _r, n=name: self._enter(n))
+                self.group.add(row)
+
+        run_async([TC, "remote", "browse", self.path, "--json"], done)
+
+    def rows(self):
+        child = self.group.get_first_child()
+        found = []
+        # Adw.PreferencesGroup wraps its children; walk for ActionRows rather than assume a shape
+        def walk(w):
+            while w is not None:
+                if isinstance(w, Adw.ActionRow):
+                    found.append(w)
+                walk(w.get_first_child())
+                w = w.get_next_sibling()
+        walk(child)
+        return found
+
+    def _enter(self, name):
+        base = self.path if self.path.endswith(":") else self.path.rstrip("/") + "/"
+        self.path = base + name
+        self._load()
+
+    def _new_folder(self):
+        dialog = Adw.AlertDialog(heading="New folder",
+                                 body="Created under %s." % self.path)
+        entry = Gtk.Entry(placeholder_text="Folder name")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("create", "Create")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("create")
+
+        def answered(_d, response):
+            name = entry.get_text().strip()
+            if response != "create" or not name:
+                return
+            base = self.path if self.path.endswith(":") else self.path.rstrip("/") + "/"
+
+            def done(ok, out):
+                if ok:
+                    self._load()
+                else:
+                    self.window.report(self.window._clean(
+                        out.strip().splitlines()[-1] if out.strip() else "") or "Could not create it.")
+
+            run_async([TC, "remote", "mkdir", base + name], done)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
+
+    def _confirm(self):
+        """Ask the engine what this move would cost before doing it."""
+        target = self.path
+        self.choose.set_sensitive(False)
+
+        def done(ok, out):
+            self.choose.set_sensitive(True)
+            body = "\n".join(self.window._clean(l) for l in out.strip().splitlines()
+                             if l.strip() and "DRY RUN" not in l)
+            if not ok:
+                self.window.report(body.splitlines()[-1] if body else "Could not check that folder.")
+                return
+            dialog = Adw.AlertDialog(heading="Use %s?" % target, body=body or
+                                     "Future backups will be written here.")
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("use", "Use this folder")
+            dialog.set_response_appearance("use", Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_close_response("cancel")
+
+            def answered(_d, response):
+                if response != "use":
+                    return
+
+                def committed(ok2, out2):
+                    if ok2:
+                        self.window.toast("Backups will now go to %s" % target)
+                        self.close()
+                        self.on_chosen()
+                    else:
+                        self.window.report(self.window._clean(
+                            out2.strip().splitlines()[-1] if out2.strip() else "") or "Failed.")
+
+                run_async([TC, "remote", "set-path", target, "--yes"], committed)
+
+            dialog.connect("response", answered)
+            dialog.present(self)
+
+        run_async([TC, "remote", "set-path", target, "--dry-run"], done)
+
+
+class CoverageDialog(Adw.Dialog):
+    """What is skipped, not just what is kept.
+
+    The include list is an allowlist, so anything unnamed is absent from every kit — and nothing in
+    this window used to say so. A real audit found /usr/local missing entirely (software no package
+    can recreate) and thirty-plus uncovered settings directories, on a machine whose backups had
+    reported success nightly for weeks. The gap was only visible to someone who walked the
+    filesystem by hand and compared it against the list.
+
+    Ordered worst-first on purpose: the actionable rows are the ones nothing covers.
+    """
+
+    GROUPS = [
+        ("UNLISTED", "Not backed up",
+         "Nothing in the include list covers these, so they are in no kit. This is the list to read."),
+        ("partial", "Partly backed up",
+         "Some of the tree is included; the rest is not."),
+        ("included", "Backed up", "Covered by the include list."),
+        ("excluded", "Deliberately excluded", "Matched by an exclude rule, shown alongside."),
+    ]
+
+    def __init__(self, window):
+        super().__init__(title="Coverage", content_width=760, content_height=640)
+        self.window = window
+        self.page = Adw.PreferencesPage()
+        self.banner = Adw.PreferencesGroup(
+            description="Reading the filesystem and comparing it against the include and exclude "
+                        "lists. Sizing large directories takes a moment.")
+        self.page.add(self.banner)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(self.page)
+        self.set_child(view)
+        self.reload()
+
+    def reload(self):
+        def done(ok, out):
+            for g in list(self._groups()):
+                self.page.remove(g)
+            if not ok:
+                self.page.add(Adw.PreferencesGroup(
+                    description="Could not read coverage: " + (out or "no output").strip()[:400]))
+                return
+            try:
+                data = json.loads(out)
+            except Exception as exc:
+                self.page.add(Adw.PreferencesGroup(description="Unreadable coverage output: %s" % exc))
+                return
+            entries = data.get("entries", [])
+            over = data.get("unlisted_over_warn", [])
+            warn_mb = data.get("warn_mb", 100)
+            if over:
+                head = Adw.PreferencesGroup()
+                row = Adw.ActionRow(
+                    title="%d %s over %sMB are in no kit"
+                          % (len(over), "directory is" if len(over) == 1 else "directories are", warn_mb),
+                    subtitle="Largest: " + ", ".join(
+                        "%s (%s)" % (e["path"].rsplit("/", 1)[-1], human_bytes(e["kb"] * 1024))
+                        for e in over[:3]))
+                row.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+                row.add_css_class("error")
+                head.add(row)
+                self.page.add(head)
+            for state, title, subtitle in self.GROUPS:
+                rows = [e for e in entries if e["state"] == state]
+                if not rows:
+                    continue
+                group = Adw.PreferencesGroup(title="%s  (%d)" % (title, len(rows)), description=subtitle)
+                # Capped deliberately, and the cap is stated rather than silently truncating —
+                # a list that quietly stops is how you conclude there is nothing more to see.
+                for e in rows[:60]:
+                    r = Adw.ActionRow(title="/" + e["path"],
+                                      subtitle=(e["rule"] if e["rule"] and e["rule"] != "-" else ""))
+                    r.set_subtitle_selectable(True)
+                    r.add_suffix(Gtk.Label(label=human_bytes(e["kb"] * 1024) if e["kb"] else "",
+                                           valign=Gtk.Align.CENTER))
+                    group.add(r)
+                if len(rows) > 60:
+                    group.add(Adw.ActionRow(title="… and %d more not shown" % (len(rows) - 60)))
+                self.page.add(group)
+
+        run_async([TC, "coverage", "--json"], done)
+
+    def _groups(self):
+        out, w = [], self.page.get_first_child()
+
+        def walk(w):
+            while w is not None:
+                if isinstance(w, Adw.PreferencesGroup) and w is not self.banner:
+                    out.append(w)
+                walk(w.get_first_child())
+                w = w.get_next_sibling()
+
+        walk(w)
+        return out
+
+
+class PathsEditor(Adw.Dialog):
+    """Edit an include/exclude list in place.
+
+    These files live in /etc and are root-owned, so the old buttons could only OPEN them — the
+    editor came up read-only and saving failed. Every change here goes through the same pkexec'd
+    binary as backup and restore, which means one authentication per change: they are conffiles
+    describing what a backup contains, and the policy for this tool is auth_admin every time
+    rather than a grace window.
+    """
+
+    LABELS = {"include": ("What gets backed up",
+                          "Paths that make up a kit. Directories are included whole; the exclude "
+                          "list prunes inside them."),
+              "exclude": ("What is left out",
+                          "Pruned from inside the included paths — caches, bulk data, anything "
+                          "reproducible.")}
+
+    def __init__(self, window, which, on_done):
+        title, subtitle = self.LABELS[which]
+        super().__init__(title=title, content_width=620, content_height=560)
+        self.window, self.which, self.on_done = window, which, on_done
+
+        page = Adw.PreferencesPage()
+        self.group = Adw.PreferencesGroup(description=subtitle)
+        page.add(self.group)
+
+        add = Adw.PreferencesGroup(title="Add a path")
+        page.add(add)
+        self.entry = Adw.EntryRow(title="Path")
+        pick = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
+        pick.set_tooltip_text("Choose a folder")
+        pick.connect("clicked", lambda *_: self._choose())
+        self.entry.add_suffix(pick)
+        add.add(self.entry)
+        self.add_button = Gtk.Button(label="Add")
+        self.add_button.add_css_class("suggested-action")
+        self.add_button.connect("clicked", lambda *_: self._add())
+        bar = Gtk.Box(halign=Gtk.Align.END, spacing=8, margin_end=12, margin_bottom=8)
+        bar.append(self.add_button)
+        add.add(bar)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(page)
+        self.set_child(view)
+        self.reload()
+
+    def rows(self):
+        found = []
+
+        def walk(w):
+            while w is not None:
+                if isinstance(w, Adw.ActionRow):
+                    found.append(w)
+                walk(w.get_first_child())
+                w = w.get_next_sibling()
+
+        walk(self.group.get_first_child())
+        return found
+
+    def reload(self):
+        for row in self.rows():
+            self.group.remove(row)
+
+        def done(ok, out):
+            if not ok:
+                self.group.add(Adw.ActionRow(
+                    title="Could not read the list",
+                    subtitle=self.window._clean(out.strip().splitlines()[-1]) if out.strip() else ""))
+                return
+            entries = [l.strip() for l in out.splitlines() if l.strip()]
+            self.group.set_title("%d entr%s" % (len(entries), "y" if len(entries) == 1 else "ies"))
+            for entry in entries:
+                row = Adw.ActionRow(title=entry)
+                row.set_title_selectable(True)
+                remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+                remove.add_css_class("flat")
+                remove.set_tooltip_text("Remove %s" % entry)
+                remove.connect("clicked", lambda _b, e=entry: self._remove(e))
+                row.add_suffix(remove)
+                self.group.add(row)
+
+        run_async([TC, "paths", self.which, "list"], done)
+
+    def _choose(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Choose a folder to %s" % ("include" if self.which == "include" else "exclude"))
+
+        def picked(source, result):
+            try:
+                path = source.select_folder_finish(result).get_path()
+            except GLib.Error:
+                return
+            self.entry.set_text(path or "")
+
+        dialog.select_folder(self.window, None, picked)
+
+    def _add(self):
+        # NOT .strip() on the value: a directory whose name ends in a space is a different
+        # directory, and the file chooser hands those over verbatim. Trim only to decide whether
+        # anything was typed at all.
+        path = self.entry.get_text()
+        if not path.strip():
+            self.window.report("Type a path, or choose a folder.")
+            return
+        self.entry.set_text("")
+        self.window.queue_privileged(["paths", self.which, "add", path], on_finished=self._after)
+
+    def _remove(self, entry):
+        dialog = Adw.AlertDialog(
+            heading="Remove this entry?",
+            body="%s\n\nThe files are not touched — they just stop being part of a backup."
+                 % entry if self.which == "include" else
+                 "%s\n\nIt will start being included again." % entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("remove", "Remove")
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: self.window.queue_privileged(
+            ["paths", self.which, "remove", entry], on_finished=self._after) if r == "remove" else None)
+        dialog.present(self)
+
+    def _after(self):
+        self.reload()
+        self.on_done()
+
+
+class RemotePage(Adw.PreferencesPage):
+    """Where the backups go: what it is, whether it works, and how to change it."""
+
+    def __init__(self, window):
+        super().__init__(title="Remote", icon_name="folder-remote-symbolic")
+        self.window = window
+        self.info = {}
+
+        conn = Adw.PreferencesGroup(
+            title="Connection",
+            description="Backups are uploaded through rclone. Nothing here needs administrator "
+                        "rights, and the access token is never shown.")
+        self.add(conn)
+        self.r_path = self._row(conn, "Folder", "folder-remote-symbolic")
+        browse = Gtk.Button(label="Browse…", valign=Gtk.Align.CENTER)
+        browse.connect("clicked", lambda *_: self._browse())
+        self.r_path.add_suffix(browse)
+        self.r_account = self._row(conn, "Account", "avatar-default-symbolic")
+        self.r_token = self._row(conn, "Authorisation", "dialog-password-symbolic")
+        self.r_reach, self.p_reach = self._pill(conn, "Reachable", "network-transmit-receive-symbolic")
+        self.r_quota = self._row(conn, "Space", "drive-harddisk-symbolic")
+
+        act = Adw.PreferencesGroup(title="Actions")
+        self.add(act)
+        self.btn_connect = self._action(
+            act, "Connect", "Sign in to the provider and store the authorisation for rclone. "
+            "Opens your browser.", "Connect…", self._connect)
+        self.btn_test = self._action(
+            act, "Test this connection",
+            "Checks that the folder can be listed AND written to. A remote that lists but refuses "
+            "writes is a backup that fails at 03:00 rather than now.", "Test", self._test)
+        self.btn_disconnect = self._action(
+            act, "Forget this remote",
+            "Stops this machine using it. Your backups are not deleted, and access is not revoked "
+            "at the provider.", "Forget…", self._disconnect)
+
+        self.reload()
+
+    def _row(self, group, title, icon):
+        row = Adw.ActionRow(title=title, subtitle="…")
+        row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+        row.set_subtitle_selectable(True)
+        group.add(row)
+        return row
+
+    def _pill(self, group, title, icon):
+        row = self._row(group, title, icon)
+        pill = Gtk.Label(label="…", valign=Gtk.Align.CENTER)
+        pill.add_css_class("pill"); pill.add_css_class("neutral")
+        row.add_suffix(pill)
+        return row, pill
+
+    def _action(self, group, title, subtitle, label, fn):
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        b = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+        b.connect("clicked", lambda *_: fn())
+        row.add_suffix(b)
+        group.add(row)
+        return b
+
+    def reload(self):
+        def done(ok, out):
+            if not ok:
+                self.r_path.set_subtitle("could not read the remote configuration")
+                self.window._set_pill(self.p_reach, "UNKNOWN", "error")
+                return
+            try:
+                self.info = json.loads(out)
+            except ValueError:
+                return
+            self._render()
+
+        run_async([TC, "remote", "status", "--json"], done)
+
+    def _render(self):
+        d, w = self.info, self.window
+        remote = d.get("remote") or ""
+        self.r_path.set_subtitle(remote or "none — this machine is not pointed at a remote")
+        if d.get("configured"):
+            self.r_account.set_subtitle(d.get("account") or "%s (rclone remote \"%s\")"
+                                        % (d.get("type", ""), d.get("name", "")))
+            self.btn_connect.set_label("Re-authorise…")
+        else:
+            self.r_account.set_subtitle("no rclone remote called \"%s\" yet" % d.get("name", ""))
+            self.btn_connect.set_label("Connect…")
+        expiry = d.get("token_expiry") or ""
+        if d.get("has_token"):
+            self.r_token.set_subtitle(
+                ("signed in — the token renews itself; the current one expires %s" % expiry[:19])
+                if expiry else "signed in")
+        else:
+            self.r_token.set_subtitle("not signed in")
+        if d.get("reachable"):
+            kits = d.get("kits")
+            self.r_reach.set_subtitle("%s backup(s) at this folder" % kits if kits != "" else "yes")
+            w._set_pill(self.p_reach, "OK", "success")
+        else:
+            self.r_reach.set_subtitle("could not list it — use Test for the reason")
+            w._set_pill(self.p_reach, "UNREACHABLE", "error")
+        used, total = d.get("remote_quota_used", ""), d.get("remote_quota_total", "")
+        self.r_quota.set_subtitle("%s of %s used" % (human_bytes(used), human_bytes(total))
+                                  if total else "not reported by this provider")
+        self.btn_test.set_sensitive(bool(remote))
+        self.btn_disconnect.set_sensitive(bool(remote))
+
+    # ---------- actions ----------
+
+    def _browse(self):
+        start = self.info.get("remote") or ""
+        FolderPicker(self.window, start, self._after_change).present(self.window)
+
+    def _after_change(self):
+        self.reload()
+        self.window.refresh()
+
+    def _connect(self):
+        self.btn_connect.set_sensitive(False)
+        self.window.log_line("$ timecrate remote connect")
+        self.window.toast("Finish the sign-in in your browser")
+
+        def done(ok, out):
+            self.btn_connect.set_sensitive(True)
+            last = [l for l in out.strip().splitlines() if l.strip()]
+            msg = self.window._clean(last[-1]) if last else ""
+            self.window.log_line(msg)
+            if ok:
+                self.window.toast("Connected")
+                self._after_change()
+            else:
+                self.window.report(msg or "Could not connect.")
+
+        run_async([TC, "remote", "connect"], done)
+
+    def _test(self):
+        self.btn_test.set_sensitive(False)
+        self.window.log_line("$ timecrate remote test")
+
+        def done(ok, out):
+            self.btn_test.set_sensitive(True)
+            last = [l for l in out.strip().splitlines() if l.strip()]
+            msg = self.window._clean(last[-1]) if last else ""
+            self.window.log_line(msg)
+            # the engine already distinguishes missing path / bad token / read-only, so show
+            # exactly what it said rather than a generic failure
+            self.window.toast("Remote OK — lists and accepts writes") if ok else self.window.report(msg)
+            self.reload()
+
+        run_async([TC, "remote", "test"], done)
+
+    def _disconnect(self):
+        dialog = Adw.AlertDialog(
+            heading="Forget this remote?",
+            body="This machine will stop using %s.\n\nYour backups are NOT deleted, and this does "
+                 "not revoke access at the provider — do that in their settings if you meant to."
+                 % (self.info.get("remote") or "it"))
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("forget", "Forget it")
+        dialog.set_response_appearance("forget", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response):
+            if response != "forget":
+                return
+
+            def done(ok, out):
+                if ok:
+                    self.window.toast("Remote forgotten")
+                    self._after_change()
+                else:
+                    self.window.report(self.window._clean(
+                        out.strip().splitlines()[-1] if out.strip() else "") or "Failed.")
+
+            run_async([TC, "remote", "disconnect", "--yes"], done)
+
+        dialog.connect("response", answered)
+        dialog.present(self.window)
+
+
+class KeysPage(Adw.PreferencesPage):
+    """The key that decrypts the backups: what exists, whether it is here, whether it is escrowed.
+
+    Nothing on this page goes through pkexec except escrow-confirm. The keyring belongs to the
+    configured user, so running these as root would put it in /root/.config, where the timers
+    would never look for it.
+    """
+
+    def __init__(self, window):
+        super().__init__(title="Keys", icon_name="dialog-password-symbolic")
+        self.window = window
+        self.keys = {}
+
+        ident = Adw.PreferencesGroup(
+            title="Identity",
+            description="The secret key is the only thing that can decrypt your backups, and it "
+                        "is deliberately not inside them. Lose it and they are lost with it.")
+        self.add(ident)
+        self.r_enc, self.p_enc = self._pill(ident, "Encryption key", "channel-secure-symbolic")
+        self.r_sign = self._row(ident, "Signing key", "emblem-ok-symbolic")
+        self.r_escrow, self.p_escrow = self._pill(ident, "Escrow", "security-high-symbolic")
+
+        act = Adw.PreferencesGroup(
+            title="Recovery",
+            description="Everything here works without administrator rights, except confirming "
+                        "the escrow.")
+        self.add(act)
+        self.btn_import = self._action(
+            act, "Import an escrowed key",
+            "Put an existing identity back on this machine. Shows you the fingerprint before it "
+            "trusts anything.", "Import…", self._import)
+        self.btn_verify = self._action(
+            act, "Check this machine can read the backups",
+            "Reads the newest archive on the remote and confirms it is encrypted to a key held "
+            "here. The recovery drill proves the escrowed copy works; this proves this one does.",
+            "Check", self._verify)
+        self.btn_export = self._action(
+            act, "Export the key for escrow",
+            "Write the secret key out so you can move it somewhere this machine is not. Refuses "
+            "any location that would end up inside a backup.", "Export…", self._export)
+        self.btn_sheet = self._action(
+            act, "Recovery sheet", "A printable page with the key and the steps to use it.",
+            "Write…", self._sheet)
+        self.btn_confirm = self._action(
+            act, "Mark the key as escrowed",
+            "Records that a copy exists off this machine, and which key it is. Needs "
+            "administrator approval.", "Confirm", self._confirm_escrow)
+
+        # `harden` is reported here, deliberately not offered. It is the one irreversible act in
+        # the tool, and its safety check is an interactive off-box comparison that a subprocess
+        # with no terminal cannot carry out, so a button could only skip that check.
+        self.hint = Adw.ActionRow(title="", subtitle="")
+        self.hint.set_subtitle_selectable(True)
+        self.hint.set_visible(False)
+        act.add(self.hint)
+
+        self.reload()
+
+    # ---------- construction helpers ----------
+
+    def _row(self, group, title, icon):
+        row = Adw.ActionRow(title=title, subtitle="…")
+        row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+        row.set_subtitle_selectable(True)
+        group.add(row)
+        return row
+
+    def _pill(self, group, title, icon):
+        row = self._row(group, title, icon)
+        pill = Gtk.Label(label="…", valign=Gtk.Align.CENTER)
+        pill.add_css_class("pill")
+        pill.add_css_class("neutral")
+        row.add_suffix(pill)
+        return row, pill
+
+    def _action(self, group, title, subtitle, label, fn):
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        button = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+        button.connect("clicked", lambda *_: fn())
+        row.add_suffix(button)
+        group.add(row)
+        return button
+
+    # ---------- state ----------
+
+    def reload(self):
+        def done(ok, out):
+            if not ok:
+                self.r_enc.set_subtitle("could not read the keyring")
+                self.window._set_pill(self.p_enc, "UNKNOWN", "error")
+                return
+            try:
+                self.keys = json.loads(out)
+            except ValueError:
+                self.r_enc.set_subtitle("unreadable output from `timecrate keys`")
+                return
+            self._render()
+
+        run_async([TC, "keys", "--json"], done)
+
+    def _render(self):
+        k = self.keys
+        fpr = k.get("encryption_fpr") or ""
+        w = self.window
+        if not fpr and not k.get("keyring_readable", True):
+            self.r_enc.set_subtitle(
+                "cannot be read by this account — %s is owned by %s"
+                % (k.get("config_dir") or "the key store", k.get("keyring_owner") or "another user"))
+            w._set_pill(self.p_enc, "UNREADABLE", "error")
+            self.r_sign.set_subtitle("unknown while the key store is unreadable")
+            self.r_escrow.set_subtitle("unknown while the key store is unreadable")
+            w._set_pill(self.p_escrow, "UNKNOWN", "warning")
+            for b in (self.btn_export, self.btn_verify, self.btn_import):
+                b.set_sensitive(False)
+            self.hint.set_title("The key store is not readable by this account")
+            self.hint.set_subtitle(
+                "This is what an `init` run under sudo leaves behind: the keyring lives in your "
+                "home but belongs to root. Until that is fixed this window cannot report or "
+                "change anything about the key. `sudo timecrate keys` can still read it.")
+            self.hint.set_visible(True)
+            return
+        if not fpr:
+            self.r_enc.set_subtitle("none — this machine cannot back up or restore yet")
+            w._set_pill(self.p_enc, "MISSING", "error")
+        elif k.get("encryption_secret_present"):
+            self.r_enc.set_subtitle(fpr)
+            w._set_pill(self.p_enc, "CAN DECRYPT", "success")
+        else:
+            self.r_enc.set_subtitle(fpr)
+            # not an error: this is what `harden` is for. But it does mean no restore from here.
+            w._set_pill(self.p_enc, "ENCRYPT ONLY", "warning")
+
+        sfpr = k.get("signing_fpr") or ""
+        if not sfpr:
+            self.r_sign.set_subtitle("none — archives from this machine would be unsigned")
+        elif k.get("signing_public_present"):
+            self.r_sign.set_subtitle("%s — signatures can be verified here" % sfpr)
+        else:
+            self.r_sign.set_subtitle("%s — public half MISSING, so restores here cannot "
+                                     "authenticate an archive" % sfpr)
+
+        state = k.get("escrow_state", "none")
+        if state == "confirmed" and k.get("escrow_fpr") == fpr:
+            self.r_escrow.set_subtitle("confirmed %s for this key" % (k.get("escrow_when") or ""))
+            w._set_pill(self.p_escrow, "CONFIRMED", "success")
+        elif state == "confirmed":
+            self.r_escrow.set_subtitle(
+                "confirmed for %s, which is not the key in use" % (k.get("escrow_fpr") or "?"))
+            w._set_pill(self.p_escrow, "STALE", "error")
+        elif state == "unknown":
+            self.r_escrow.set_subtitle(
+                "confirmed by an older version that did not record which key or when")
+            w._set_pill(self.p_escrow, "UNVERIFIED", "warning")
+        else:
+            self.r_escrow.set_subtitle("no copy of this key is known to exist off this machine")
+            w._set_pill(self.p_escrow, "ACTION NEEDED", "error")
+
+        self.btn_export.set_sensitive(bool(k.get("encryption_secret_present")))
+        self.btn_verify.set_sensitive(bool(fpr))
+        if fpr and not k.get("encryption_secret_present"):
+            self.hint.set_title("This machine is encrypt-only")
+            self.hint.set_subtitle(
+                "The secret key was removed by `harden`, or was never imported. Restoring here "
+                "needs the escrowed copy — import it above.")
+            self.hint.set_visible(True)
+        else:
+            self.hint.set_visible(False)
+
+    # ---------- actions ----------
+
+    def _import(self):
+        ImportKeyDialog(self.window, self._after_change).present(self.window)
+
+    def _after_change(self):
+        self.reload()
+        self.window.refresh()
+
+    def _verify(self):
+        self.btn_verify.set_sensitive(False)
+        self.window.log_line("$ timecrate verify-key")
+
+        def done(ok, out):
+            self.btn_verify.set_sensitive(True)
+            last = [l for l in out.strip().splitlines() if l.strip()]
+            msg = self.window._clean(last[-1]) if last else ""
+            if ok:
+                self.window.toast("This machine can read the backups")
+            else:
+                self.window.report(msg or "Could not check the key.")
+            self.window.log_line(msg)
+
+        run_async([TC, "verify-key"], done)
+
+    def _export(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Export the secret key")
+        dialog.set_initial_name("timecrate-secret.asc")
+
+        def picked(source, result):
+            try:
+                path = source.save_finish(result).get_path()
+            except GLib.Error:
+                return
+
+            def done(ok, out):
+                last = out.strip().splitlines()[-1] if out.strip() else ""
+                if ok:
+                    self.window.toast("Key exported — now move it off this machine")
+                    self.window.log_line("exported the secret key to %s" % path)
+                else:
+                    self.window.report(self.window._clean(last) or "Export failed.")
+
+            run_async([TC, "export-key", "--out", path], done)
+
+        dialog.save(self.window, None, picked)
+
+    def _sheet(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Write the recovery sheet")
+        dialog.set_initial_name("timecrate-recovery-sheet.txt")
+
+        def picked(source, result):
+            try:
+                path = source.save_finish(result).get_path()
+            except GLib.Error:
+                return
+
+            def done(ok, out):
+                if ok:
+                    self.window.toast("Recovery sheet written")
+                    self.window.log_line("recovery sheet written to %s" % path)
+                else:
+                    self.window.report(self.window._clean(
+                        out.strip().splitlines()[-1] if out.strip() else "") or "Failed.")
+
+            run_async([TC, "escrow-doc", path], done)
+
+        dialog.save(self.window, None, picked)
+
+    def _confirm_escrow(self):
+        dialog = Adw.AlertDialog(
+            heading="Is a copy of this key somewhere else?",
+            body="Only confirm this if a copy of the secret key exists somewhere this machine "
+                 "does not — a password manager, a printed sheet, a USB stick kept elsewhere. "
+                 "Confirming it while no copy exists is how backups become unrecoverable.")
+        dialog.add_response("cancel", "Not yet")
+        dialog.add_response("confirm", "Yes, a copy exists")
+        dialog.set_response_appearance("confirm", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: self.window.queue_privileged(["escrow-confirm"])
+                       if r == "confirm" else None)
+        dialog.present(self.window)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Timecrate",
+                         default_width=860, default_height=880)
+        self.busy = False
+        self.current_kind = None
+        self.keys = {}
+        self._first_run_shown = False
+        self._privileged_done = None
+        self.last_error = ""
+        self.warnings = []
+        self.kit_names = []
+        self.kit_rows = []
+        self.status = {}
+        self.staged_path = ""
+        self.pending_privileged = []
+        self._banner_handler = None
+
+        self._install_css()
+
+        self.overlay = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(title="Timecrate", subtitle="Encrypted off-site backup"))
+
+        self.refresh_button = Gtk.Button(icon_name="view-refresh-symbolic")
+        self.refresh_button.set_tooltip_text("Refresh status and backups (Ctrl+R)")
+        self.refresh_button.update_property([Gtk.AccessibleProperty.LABEL], ["Refresh"])
+        self.refresh_button.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(self.refresh_button)
+
+        menu = Gio.Menu()
+        menu.append("Settings", "win.settings")
+        menu.append("Remote and folder", "win.remote")
+        menu.append("Keys and recovery", "win.keys")
+        menu.append("Refresh", "win.refresh")
+        menu.append("Help and shortcuts", "win.help")
+        menu.append("About Timecrate", "win.about")
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        menu_button.set_tooltip_text("Main menu")
+        menu_button.update_property([Gtk.AccessibleProperty.LABEL], ["Main menu"])
+        header.pack_end(menu_button)
+
+        self.header_spinner = Gtk.Spinner()
+        header.pack_end(self.header_spinner)
+        view.add_top_bar(header)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.banner = Adw.Banner()
+        self.banner.set_revealed(False)
+        box.append(self.banner)
+
+        page = Adw.PreferencesPage()
+        box.append(page)
+        view.set_content(box)
+        self.overlay.set_child(view)
+        self.set_content(self.overlay)
+
+        # Order matters: the backup list used to sit under Status AND "Encryption and key
+        # safety", which put the thing people open this window to look at below the fold.
+        self._build_status(page)
+        self._build_actions(page)
+        self._build_kits(page)
+        self._build_checks(page)
+        self._build_crypto(page)
+        self._build_log(page)
+
+        for name, fn in (("settings", self.open_settings), ("refresh", self.refresh),
+                         ("keys", self.open_keys), ("remote", self.open_remote),
+                         ("help", self.open_help), ("about", self.open_about)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_a, f=fn: f())
+            self.add_action(action)
+        app.set_accels_for_action("win.refresh", ["<Ctrl>r"])
+        app.set_accels_for_action("win.settings", ["<Ctrl>comma"])
+
+        # A privileged child is a root process holding a lock and, during a restore, writing to
+        # disk. Closing the window would orphan it with nothing left watching its output.
+        self.connect("close-request", self._on_close_request)
+        self.refresh()
+
+    # ---------- construction ----------
+
+    def _install_css(self):
+        # The pill colours are per-scheme and the CSS is reloaded when the scheme changes, because
+        # GTK4 CSS has no prefers-color-scheme and one set of colours cannot serve both. The first
+        # version had only the light set: on a dark desktop the status pills measured 1.36–1.61:1,
+        # which is not "a bit low", it is invisible — the whole point of a pill being that you can
+        # read the state at a glance. Every value below is measured, not chosen by eye, and
+        # gui-smoke asserts the ratios so this cannot quietly regress.
+        self._css_provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self._css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        manager = Adw.StyleManager.get_default()
+        manager.connect("notify::dark", lambda *_: self._apply_css())
+        self._apply_css()
+
+    def _apply_css(self):
+        dark = Adw.StyleManager.get_default().get_dark()
+        # WCAG AA for normal text is 4.5:1. Measured against the resolved window background of
+        # each scheme; see PILL_CONTRAST in hardening/gui-smoke.sh for the assertion.
+        pills = PILL_DARK if dark else PILL_LIGHT
+        self.pill_palette = pills          # what was actually applied, for the contrast check
+        css = ("""
+        .pill { border-radius: 999px; padding: 3px 9px; font-weight: 700; font-size: 0.86em; }
+        .pill.success { color: %(success_fg)s; background: alpha(%(success_bg)s, %(alpha)s); }
+        .pill.warning { color: %(warning_fg)s; background: alpha(%(warning_bg)s, %(alpha)s); }
+        .pill.error   { color: %(error_fg)s;   background: alpha(%(error_bg)s, %(alpha)s); }
+        .pill.neutral { color: @window_fg_color; background: alpha(@window_fg_color, 0.10); }
+        .operation-box { padding: 12px; }
+        .dim-small { opacity: 0.72; font-size: 0.92em; }
+        """ % pills).encode()
+        self._css_provider.load_from_data(css)
+
+    def _build_status(self, page):
+        overview = Adw.PreferencesGroup(title="Status",
+                                        description="Read from `timecrate status`.")
+        page.add(overview)
+        self.r_last = self._row(overview, "Last backup", "document-save-symbolic")
+        self.r_cloud, self.p_cloud = self._pill_row(
+            overview, "Backups on the remote", "folder-remote-symbolic")
+        self.r_local = self._row(overview, "Local copies", "drive-harddisk-symbolic")
+        self.r_conf = self._row(overview, "Configuration", "document-properties-symbolic")
+
+    def _build_crypto(self, page):
+        crypto = Adw.PreferencesGroup(title="Encryption and key safety")
+        page.add(crypto)
+        self.r_cipher = self._row(crypto, "Encryption", "channel-secure-symbolic")
+        self.r_key = self._row(crypto, "Key", "dialog-password-symbolic")
+        self.r_escrow, self.p_escrow = self._pill_row(crypto, "Key escrow", "security-high-symbolic")
+        self.r_drill, self.p_drill = self._pill_row(crypto, "Recovery drill", "emblem-ok-symbolic")
+
+    def _build_actions(self, page):
+        group = Adw.PreferencesGroup(title="Run")
+        page.add(group)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.add_css_class("card")
+        card.add_css_class("operation-box")
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.operation_spinner = Gtk.Spinner(valign=Gtk.Align.CENTER)
+        top.append(self.operation_spinner)
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.operation_title = Gtk.Label(label="Ready", xalign=0)
+        self.operation_title.add_css_class("heading")
+        self.operation_step = Gtk.Label(
+            label="Choose an action. Each one asks for administrator approval.", xalign=0)
+        self.operation_step.add_css_class("dim-small")
+        self.operation_step.set_wrap(True)
+        text.append(self.operation_title)
+        text.append(self.operation_step)
+        top.append(text)
+        card.append(top)
+
+        self.progress = Gtk.ProgressBar(show_text=False)
+        self.progress.set_fraction(0.0)
+        card.append(self.progress)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                          halign=Gtk.Align.START)
+        self.btn_backup = Gtk.Button(label="Back Up Now")
+        self.btn_backup.add_css_class("suggested-action")
+        self.btn_backup.connect("clicked", lambda *_: self.confirm_run(
+            ["backup"], "Back up now?",
+            "Creates an encrypted, signed archive and uploads it to the remote.", "Back Up"))
+        self.btn_preview = Gtk.Button(label="Preview")
+        self.btn_preview.set_tooltip_text("Show what would be backed up. Uploads nothing.")
+        self.btn_preview.connect("clicked", lambda *_: self.run(["backup", "--dry-run"]))
+        self.btn_drill = Gtk.Button(label="Recovery Drill")
+        self.btn_drill.set_tooltip_text("Prove the escrowed key can still decrypt a real backup")
+        self.btn_drill.connect("clicked", lambda *_: self.confirm_run(
+            ["recovery-drill"], "Run a recovery drill?",
+            "Fetches a real archive from the remote and proves the escrowed key alone can "
+            "decrypt and authenticate it. This is the test of whether the backups are actually "
+            "recoverable.", "Run Drill"))
+        for button in (self.btn_backup, self.btn_preview, self.btn_drill):
+            buttons.append(button)
+        card.append(buttons)
+        group.add(card)
+
+    KIT_GROUP_DESC = ("Newest first. Restoring fetches an archive, verifies its signature, "
+                      "then decrypts and extracts it into a staging folder — your running "
+                      "system is not touched.")
+
+    def _build_kits(self, page):
+        self.kit_group = Adw.PreferencesGroup(
+            title="Backups on the remote", description=self.KIT_GROUP_DESC)
+        page.add(self.kit_group)
+
+        self.kit_stack = Gtk.Stack(vexpand=False)
+        self.kit_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.kit_list.add_css_class("boxed-list")
+        scroll = Gtk.ScrolledWindow(min_content_height=220, max_content_height=320)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_child(self.kit_list)
+        self.kit_stack.add_named(scroll, "list")
+
+        self.kit_stack.add_named(Adw.StatusPage(
+            title="No backups yet",
+            description="Run a backup to create the first encrypted archive.",
+            icon_name="folder-symbolic"), "empty")
+
+        self.kit_error = Adw.StatusPage(title="Could not read the remote", description="",
+                                        icon_name="dialog-warning-symbolic")
+        self.kit_stack.add_named(self.kit_error, "error")
+        self.kit_group.add(self.kit_stack)
+
+    def _open_full_log(self):
+        # A terminal, not a pane in this window: it is a pager over a journal that can be long,
+        # and the terminal already does paging, searching and following properly.
+        # NOT --no-pager: journalctl would print and exit, and the terminal would close before
+        # anyone read it. The pager is the whole reason for opening a terminal.
+        for argv in (["gnome-terminal", "--", "journalctl", "-u", "timecrate-backup.service",
+                      "-u", "timecrate-drill.service", "-n", "500", "-e"],
+                     ["x-terminal-emulator", "-e",
+                      "journalctl -u timecrate-backup.service -u timecrate-drill.service -e"]):
+            try:
+                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+                return
+            except GLib.Error:
+                continue
+        self.report("Could not open a terminal. Run:  journalctl -u timecrate-backup.service")
+
+    def _on_history(self, ok, out):
+        for row in self.history_rows:
+            self.history_expander.remove(row)
+        self.history_rows = []
+        if not ok:
+            return
+        try:
+            runs = json.loads(out)
+        except ValueError:
+            return
+        if not runs:
+            row = Adw.ActionRow(title="Nothing recorded yet")
+            self.history_expander.add_row(row)
+            self.history_rows.append(row)
+            return
+        for run in reversed(runs[-12:]):
+            when = (run.get("when") or "")[:19].replace("T", " ")
+            if run.get("kind") == "drill":
+                result = run.get("result", "?")
+                row = Adw.ActionRow(title="Recovery drill — %s" % result, subtitle=when)
+                # by result, not unconditionally: a FAILED drill wearing a success icon is the
+                # green-light-that-lies this window keeps having to be talked out of
+                row.add_prefix(Gtk.Image.new_from_icon_name(
+                    "emblem-ok-symbolic" if result == "PASSED" else "dialog-warning-symbolic"))
+            else:
+                # size and duration are absent on anything written before 1.9.0: say so rather
+                # than render a confident 0 B
+                size = human_bytes(run.get("bytes", ""))
+                secs = run.get("seconds") or ""
+                detail = "%s%s" % (size if run.get("bytes") else "size not recorded",
+                                   " in %ss" % secs if secs else "")
+                row = Adw.ActionRow(title="Backup — %s" % detail, subtitle=when)
+                row.add_prefix(Gtk.Image.new_from_icon_name(
+                    "document-save-symbolic" if run.get("result") == "ok"
+                    else "dialog-warning-symbolic"))
+            self.history_expander.add_row(row)
+            self.history_rows.append(row)
+
+    def _check_row(self, group, title, subtitle, label, fn, destructive=False):
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        row.set_subtitle_lines(0)
+        button = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+        if destructive:
+            button.add_css_class("destructive-action")
+        button.connect("clicked", lambda *_: fn())
+        row.add_suffix(button)
+        group.add(row)
+        return button
+
+    def _build_checks(self, page):
+        # Everything here was already in the CLI and reachable from nowhere else. The window is
+        # allowed to offer less than the command line, never more -- so these are the same
+        # commands, not new capability.
+        group = Adw.PreferencesGroup(
+            title="Checks and recovery",
+            description="Proving the backups are readable, and the two ways of getting a machine "
+                        "back that do not go through the normal restore.")
+        page.add(group)
+
+        self.btn_verify_newest = self._check_row(
+            group, "Verify the newest backup",
+            "Fetches it and checks the signature, the decryption and the archive itself. "
+            "Needs no administrator approval.", "Verify", self.verify_newest)
+        self.btn_verify_all = self._check_row(
+            group, "Verify every backup",
+            "The same check against every archive on the remote, one at a time. Downloads each "
+            "one, so it takes a while and reports how many of how many passed.",
+            "Verify All", self.verify_all)
+        self.btn_to_root = self._check_row(
+            group, "Restore over this system",
+            "Bare-metal recovery: extracts the newest backup straight over / as root, "
+            "overwriting what is there now. Asks you to type a confirmation.",
+            "Restore to /…", self.confirm_restore_to_root, destructive=True)
+        self.btn_break_glass = self._check_row(
+            group, "Break-glass recovery",
+            "Recover from a kit you already have on disk, and print the raw gpg and tar commands "
+            "that do it — the path that works when this tool does not.",
+            "Break Glass…", self.choose_break_glass)
+
+    def _build_log(self, page):
+        group = Adw.PreferencesGroup(title="Activity")
+        page.add(group)
+
+        # What this machine has actually been doing. The engine has recorded size and duration
+        # since 1.9.0 and nothing ever showed it, so "is it still running, and is it still the
+        # same size" was a question you could only answer by reading a log file as root.
+        self.history_expander = Adw.ExpanderRow(
+            title="Recent runs", subtitle="Backups and drills, newest first")
+        self.history_rows = []
+        group.add(self.history_expander)
+
+        full = Adw.ActionRow(
+            title="Full log",
+            subtitle="Everything the scheduled runs have written, from the system journal")
+        open_full = Gtk.Button(label="Open", valign=Gtk.Align.CENTER)
+        open_full.connect("clicked", lambda *_: self._open_full_log())
+        full.add_suffix(open_full)
+        group.add(full)
+
+        self.log_expander = Adw.ExpanderRow(title="Log",
+                                            subtitle="Output from the command-line tool")
+        self.logview = Gtk.TextView(
+            editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=6, left_margin=6, right_margin=6, bottom_margin=6)
+        scroller = Gtk.ScrolledWindow(min_content_height=170)
+        scroller.set_child(self.logview)
+        scroller.add_css_class("card")
+        self.log_expander.add_row(scroller)
+        group.add(self.log_expander)
+
+    def _row(self, group, title, icon):
+        row = Adw.ActionRow(title=title, subtitle="…")
+        row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+        group.add(row)
+        return row
+
+    def _pill_row(self, group, title, icon):
+        row = self._row(group, title, icon)
+        pill = Gtk.Label(label="…", valign=Gtk.Align.CENTER)
+        pill.add_css_class("pill")
+        pill.add_css_class("neutral")
+        row.add_suffix(pill)
+        return row, pill
+
+    def _set_pill(self, pill, text, state):
+        for klass in ("success", "warning", "error", "neutral"):
+            pill.remove_css_class(klass)
+        pill.add_css_class(state)
+        pill.set_label(text)
+
+    # ---------- helpers the settings dialog uses ----------
+
+    def log_line(self, text):
+        buf = self.logview.get_buffer()
+        buf.insert(buf.get_end_iter(), text.rstrip("\n") + "\n")
+        self.logview.scroll_to_iter(buf.get_end_iter(), 0.0, False, 0, 0)
+
+    def toast(self, text):
+        self.overlay.add_toast(Adw.Toast(title=text))
+
+    def report(self, text):
+        self.log_line(text)
+        self._set_banner(text)
+
+    def _set_banner(self, title, button_label=None, on_click=None):
+        if self._banner_handler is not None:
+            self.banner.disconnect(self._banner_handler)
+            self._banner_handler = None
+        self.banner.set_title(title)
+        self.banner.set_button_label(button_label or "")
+        if on_click is not None:
+            self._banner_handler = self.banner.connect("button-clicked", lambda *_: on_click())
+        self.banner.set_revealed(True)
+
+    def open_settings(self):
+        SettingsDialog(self, self.status).present(self)
+
+    def open_help(self):
+        # One dialog, deliberately, rather than a Gtk.ShortcutsWindow plus a separate help viewer.
+        # There are two accelerators, and a Help entry that needs a documentation browser
+        # installed is a Help entry that does nothing on the rescue box where it matters most.
+        # What someone opens Help for in a backup tool is "how do I get my machine back", so
+        # that is what it answers, and it names files that ship in the package.
+        dialog = Adw.AlertDialog(
+            heading="Help",
+            body="<b>Getting a machine back</b>\n"
+                 "The key is what matters — without it nothing here can be read. Keys and "
+                 "recovery ▸ Import lets a rebuilt machine take back its identity from the "
+                 "escrowed key, and Verify proves this machine can read the backups.\n\n"
+                 "<b>If this application will not run</b>\n"
+                 "Recovery deliberately needs nothing but <tt>gpg</tt>, <tt>zstd</tt> and "
+                 "<tt>tar</tt>. <tt>timecrate break-glass &lt;kit&gt;</tt> prints those raw "
+                 "commands and runs them; the printed steps work with this tool uninstalled.\n\n"
+                 "<b>Documentation</b>\n"
+                 "<tt>man timecrate</tt>, and the restore and break-glass guides in\n"
+                 "<tt>/usr/share/doc/timecrate/</tt>\n"
+                 "(the directory, not a fixed filename: packaging gzips whichever of them is "
+                 "over 4 KB, so the extension is not stable — <tt>zless</tt> reads both.)\n\n"
+                 "<b>Keyboard</b>\n"
+                 "<tt>Ctrl+R</tt> refresh   <tt>Ctrl+,</tt> settings")
+        dialog.set_body_use_markup(True)
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.set_close_response("close")
+        dialog.present(self)
+
+    def open_about(self):
+        about = Adw.AboutDialog(
+            application_name="Timecrate",
+            application_icon=APP_ID,
+            developer_name="Spencer Norton",
+            copyright="© 2026 Spencer Norton",
+            version=self.status.get("version") or "unknown",
+            comments="Encrypted off-site disaster-recovery backup.\n\nEverything this window does "
+                     "is carried out by the `timecrate` command, so a machine with no graphical "
+                     "session loses no capability.",
+            website="https://github.com/spencercnorton/timecrate",
+            issue_url="https://github.com/spencercnorton/timecrate/issues",
+            license_type=Gtk.License.GPL_2_0)
+        about.add_credit_section("Backups run as", [self.status.get("user") or "?"])
+        about.present(self)
+
+    def open_remote(self):
+        dialog = SettingsDialog(self, self.status)
+        dialog.set_visible_page(dialog.remote_page)
+        dialog.present(self)
+
+    def open_keys(self):
+        dialog = SettingsDialog(self, self.status)
+        dialog.set_visible_page(dialog.keys_page)
+        dialog.present(self)
+
+    def queue_privileged(self, args, on_finished=None):
+        """Run a privileged command, or queue it if one is already running."""
+        if on_finished is not None:
+            self._privileged_done = on_finished
+        if self.busy:
+            self.pending_privileged.append(args)
+        else:
+            self.run(args)
+
+    # ---------- running things ----------
+
+    def _allowed_args(self, args):
+        if args in (["backup"], ["backup", "--dry-run"], ["recovery-drill"]):
+            return True
+        if args[:1] == ["restore"] and len(args) == 2:
+            return args[1] in self.kit_names
+        # restore --to-root overwrites /, so the kit still has to be one the remote actually
+        # listed; the typed confirmation is upstream of this, not a substitute for it.
+        if args[:1] == ["restore"] and len(args) == 3 and args[2] == "--to-root":
+            return args[1] in self.kit_names
+        # break-glass <kit> <target>: both come from a file chooser, and both are re-checked
+        # here because a path that vanished between choosing and running would otherwise be
+        # handed to a root process.
+        # / is excluded because extracting a kit there overwrites the running system, which is
+        # restore --to-root's job and gated by the typed confirmation. The engine refuses it too,
+        # and that refusal is the actual boundary — this one only makes the window say so without
+        # spending an administrator prompt first.
+        if args[:1] == ["break-glass"] and len(args) == 3:
+            return (os.path.isfile(args[1]) and os.access(args[1], os.R_OK)
+                    and os.path.isdir(args[2]) and os.access(args[2], os.R_OK)
+                    and os.path.realpath(args[2]) != "/")
+        if args in (["escrow-confirm"], ["alerts", "test"]):
+            return True
+        # paths <include|exclude> <add|remove> <path>: the list name comes from a fixed pair and
+        # the engine re-validates the path itself (no newline, no ..), so this stays an
+        # enumeration rather than a pattern that could be talked into something else.
+        if (args[:1] == ["paths"] and len(args) == 4
+                and args[1] in ("include", "exclude") and args[2] in ("add", "remove")):
+            return True
+        if args[:1] == ["schedule"] and len(args) in (3, 5):
+            return (args[1] in ("backup", "drill") and args[2] in ("on", "off")
+                    and (len(args) == 3 or args[3] == "--at"))
+        return False
+
+    def _kind_for_args(self, args):
+        return "dry-run" if args == ["backup", "--dry-run"] else args[0]
+
+    def _set_busy(self, on):
+        self.busy = on
+        for button in (self.btn_backup, self.btn_preview, self.btn_drill, self.refresh_button,
+                       self.btn_verify_newest, self.btn_verify_all, self.btn_to_root,
+                       self.btn_break_glass):
+            button.set_sensitive(not on)
+        for row in self.kit_rows:
+            row.set_busy(on)
+        (self.header_spinner.start if on else self.header_spinner.stop)()
+        (self.operation_spinner.start if on else self.operation_spinner.stop)()
+
+    def _set_operation(self, title, step, fraction=None):
+        self.operation_title.set_label(title)
+        self.operation_step.set_label(step)
+        if fraction is not None:
+            self.progress.set_fraction(fraction)
+
+    def confirm_run(self, args, heading, body, action_label):
+        if self.busy:
+            return
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("run", action_label)
+        dialog.set_response_appearance("run", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("run")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, resp: self.run(args) if resp == "run" else None)
+        dialog.present(self)
+
+    def confirm_restore(self, filename):
+        if self.busy:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Restore this backup?",
+            body="%s\n\nThe archive will be fetched, its signature verified, then decrypted and "
+                 "extracted into a staging folder for you to inspect. Your running system will "
+                 "not be overwritten." % self._kit_display(filename))
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("restore", "Restore")
+        dialog.set_response_appearance("restore", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("restore")
+        dialog.set_close_response("cancel")
+        dialog.connect("response",
+                       lambda _d, resp: self.run(["restore", filename]) if resp == "restore" else None)
+        dialog.present(self)
+
+    def verify_newest(self):
+        self.run_readonly(["verify", "--remote"], "Verifying the newest backup",
+                          "The newest backup verified.")
+
+    def verify_all(self):
+        self.run_readonly(["verify", "--remote", "--all"], "Verifying every backup",
+                          "Every backup on the remote verified.")
+
+    def run_readonly(self, args, title, success):
+        """Run a command that needs no root: same busy/log treatment as run(), without pkexec.
+
+        `verify` requires no privilege — it reads the remote and decrypts into the user's own
+        staging directory — so asking for an administrator password to run a read-only check
+        would be theatre, and a prompt the user learns to click through is worse than no prompt.
+
+        Until 2.6.0 there was a second, sharper reason: pkexec sets no SUDO_USER, so on a machine
+        that had not pinned TIMECRATE_USER the engine resolved the account to root and looked
+        for the keyring in root's home, where it is not. The engine reads PKEXEC_UID now, so a
+        privileged verify would resolve correctly — but it would still be an administrator prompt
+        for a read-only check, which is reason enough on its own.
+        """
+        if self.busy:
+            return
+        self.last_error = ""
+        self.warnings = []
+        self._set_busy(True)
+        self._set_operation(title, "Fetching and checking — this reads the remote.", 0.05)
+        self.banner.set_revealed(False)
+        self.log_line("$ " + " ".join([TC] + args))
+
+        def finished(ok, out):
+            for line in out.splitlines():
+                self.log_line(line)
+                if "[timecrate][WARN]" in line:
+                    self.warnings.append(self._clean(line))
+            self._set_busy(False)
+            if ok:
+                self._set_operation(success, "Up to date.", 1.0)
+                self.toast(success)
+                self._set_banner(success)
+            else:
+                lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+                message = self._clean(lines[-1]) if lines else "%s failed." % title
+                self._set_operation("It did not work", message, 1.0)
+                self._set_banner(message)
+                self.log_expander.set_expanded(True)
+                self.toast("Failed")
+            # Same rule as a privileged run: a warning outranks the success banner. A verify that
+            # passed while also saying "checksum step SKIPPED" is not a clean verify.
+            if self.warnings:
+                summary = self.warnings[0] if len(self.warnings) == 1 else \
+                    "%s (and %d more in the log)" % (self.warnings[0], len(self.warnings) - 1)
+                self._set_banner("Warning: " + summary)
+                self.log_expander.set_expanded(True)
+
+        run_async([TC] + args, finished)
+
+    def confirm_restore_to_root(self):
+        if self.busy:
+            return
+        if not self.kit_names:
+            self.report("There is no backup on the remote to restore from.")
+            return
+        newest = self.kit_names[0]
+        dialog = Adw.AlertDialog(
+            heading="Restore over this running system?",
+            body="%s will be fetched, its signature verified, and then extracted straight over / "
+                 "as root. Files on this machine are overwritten with the versions in that "
+                 "backup, and there is no undo.\n\nType RESTORE to confirm." % self._kit_display(newest))
+        entry = Gtk.Entry(placeholder_text="RESTORE")
+        dialog.set_extra_child(entry)
+        # kept so the smoke test can prove the gate actually gates; nothing else reads them
+        self._to_root_dialog, self._to_root_entry = dialog, entry
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("go", "Restore over /")
+        dialog.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_enabled("go", False)
+        dialog.set_close_response("cancel")
+        entry.connect("changed",
+                      lambda e: dialog.set_response_enabled("go", e.get_text() == "RESTORE"))
+
+        def responded(_dialog, response):
+            # Re-checked here and not only through the disabled button: a default response or an
+            # accelerator must not be able to start this without the word being typed.
+            if response == "go" and entry.get_text() == "RESTORE":
+                self.run(["restore", newest, "--to-root"])
+
+        dialog.connect("response", responded)
+        dialog.present(self)
+
+    def choose_break_glass(self):
+        if self.busy:
+            return
+        kit_dialog = Gtk.FileDialog()
+        kit_dialog.set_title("Encrypted kit to recover from")
+
+        def picked_kit(source, result):
+            try:
+                kit = source.open_finish(result).get_path()
+            except GLib.Error:
+                return                      # cancelled — not an error worth reporting
+            target_dialog = Gtk.FileDialog()
+            target_dialog.set_title("Where to extract it")
+
+            def picked_target(src, res):
+                try:
+                    target = src.select_folder_finish(res).get_path()
+                except GLib.Error:
+                    return
+                if os.path.realpath(target) == "/":
+                    self.report("Break-glass extracts into a folder so you can inspect what is "
+                                "in the backup. To write a backup over this running system, use "
+                                "“Restore to /”, which asks you to confirm first.")
+                    return
+                self.run(["break-glass", kit, target])
+
+            target_dialog.select_folder(self, None, picked_target)
+
+        kit_dialog.open(self, None, picked_kit)
+
+    def run(self, args):
+        if self.busy:
+            return
+        if not self._allowed_args(args):
+            self.report("Blocked an unsupported privileged command: %s" % " ".join(args))
+            return
+
+        argv = ["pkexec", TC] + args
+        self.current_kind = self._kind_for_args(args)
+        self.last_error = ""
+        self.warnings = []
+        self.staged_path = ""
+        self._set_busy(True)
+        self._set_operation(self._operation_name(), "Waiting for administrator approval…", 0.02)
+        self.banner.set_revealed(False)
+        self.log_line("$ " + " ".join(argv))
+
+        try:
+            proc = Gio.Subprocess.new(
+                argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        except GLib.Error as exc:
+            self.log_line("ERROR: " + exc.message)
+            self._finish_action(False, exc.message)
+            return
+        self._pump(Gio.DataInputStream.new(proc.get_stdout_pipe()), proc)
+
+    def _operation_name(self):
+        return {
+            "backup": "Backing up", "dry-run": "Previewing",
+            "recovery-drill": "Running a recovery drill", "restore": "Restoring",
+            "schedule": "Updating the schedule", "escrow-confirm": "Recording the escrow",
+            "paths": "Updating the backup list", "alerts": "Sending a test alert",
+            "break-glass": "Break-glass recovery",
+        }.get(self.current_kind, "Working")
+
+    def _operation_success(self):
+        return {
+            "backup": "Backup complete", "dry-run": "Preview complete",
+            "recovery-drill": "Recovery drill passed",
+            "restore": "Restore staged for inspection", "schedule": "Schedule updated",
+        }.get(self.current_kind, "Done")
+
+    def _pump(self, stream, proc):
+        def on_line(source, result):
+            try:
+                line, _length = source.read_line_finish_utf8(result)
+            except GLib.Error:
+                line = None
+            if line is None:
+                proc.wait_async(None, on_done)
+                return
+            self.log_line(line)
+            self._handle_progress_line(line)
+            source.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+        def on_done(process, result):
+            try:
+                process.wait_finish(result)
+            except GLib.Error as exc:
+                self._finish_action(False, self.last_error or exc.message)
+                return
+            status = process.get_exit_status() if process.get_if_exited() else -1
+            # pkexec's own codes, not the tool's. "failed: code 126" for a dismissed password
+            # prompt reads like a crash, and it is the most common outcome of clicking Cancel.
+            if status == PKEXEC_CANCELLED and not self.last_error:
+                self._finish_action(None, "Cancelled at the authentication prompt. Nothing ran.")
+                return
+            if status == PKEXEC_NOT_AUTHORISED and not self.last_error:
+                self._finish_action(False, "Not authorised. This needs an administrator account.")
+                return
+            self._finish_action(status == 0 and not self.last_error, self.last_error)
+
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+    def _handle_progress_line(self, line):
+        if "[timecrate][ERROR]" in line:
+            self.last_error = line
+            self._set_operation(self._operation_name(), self._clean(line), 1.0)
+            return
+        # Warnings are how the engine reports a stale drill, a missing include, unpushed commits
+        # or an escrow copy it could not verify. They used to scroll past inside a collapsed log.
+        if "[timecrate][WARN]" in line:
+            self.warnings.append(self._clean(line))
+            return
+        if "RECOVERY DRILL FAILED" in line:
+            self.last_error = line
+            return
+        match = STAGED_RE.search(line)
+        if match:
+            self.staged_path = match.group(1)
+        for needle, label, fraction in MILESTONES.get(self.current_kind, []):
+            if needle in line:
+                self._set_operation(self._operation_name(), label, fraction)
+                return
+
+    def _finish_action(self, ok, error):
+        self._set_busy(False)
+        kind, staged = self.current_kind, self.staged_path
+        self.current_kind = None
+
+        if ok is None:  # cancelled: neither a success nor a failure
+            self.progress.set_fraction(0.0)
+            self._set_operation("Cancelled", error, 0.0)
+            self.toast("Cancelled")
+        elif ok:
+            self.progress.set_fraction(1.0)
+            detail = "Extracted to %s" % staged if kind == "restore" and staged else "Up to date."
+            self._set_operation(self._success_title(kind), detail, 1.0)
+            self.toast(self._success_title(kind))
+            if kind == "restore" and staged:
+                self._set_banner("Restored to %s" % staged, "Show Folder",
+                                 lambda: Gio.AppInfo.launch_default_for_uri("file://" + staged, None))
+            else:
+                self._set_banner(self._success_title(kind))
+        else:
+            message = self._clean(error) if error else "It failed. See the log for what happened."
+            self._set_operation("It did not work", message, 1.0)
+            self._set_banner(message)
+            self.log_expander.set_expanded(True)
+            self.toast("Failed")
+
+        # A warning outranks a success banner: an `ok` backup that also said DRILL STALE or
+        # "include entry missing on disk" is exactly the run you must not walk away from.
+        if self.warnings:
+            summary = self.warnings[0] if len(self.warnings) == 1 else \
+                "%s (and %d more in the log)" % (self.warnings[0], len(self.warnings) - 1)
+            self._set_banner("Warning: " + summary)
+            self.log_expander.set_expanded(True)
+
+        self.refresh()
+        if self.pending_privileged:
+            self.run(self.pending_privileged.pop(0))
+        elif self._privileged_done is not None:
+            # Only once the queue is drained: a dialog that reloaded after each queued command
+            # would show a half-applied list.
+            done, self._privileged_done = self._privileged_done, None
+            done()
+
+    def _success_title(self, kind):
+        return {
+            "backup": "Backup complete", "dry-run": "Preview complete",
+            "recovery-drill": "Recovery drill passed",
+            "restore": "Restore staged for inspection", "schedule": "Schedule updated",
+        }.get(kind, "Done")
+
+    def _clean(self, line):
+        if not line:
+            return ""
+        text = line.strip()
+        for marker in ("[timecrate][ERROR]", "[timecrate][WARN]", "[timecrate]"):
+            if marker in text:
+                return text.split(marker, 1)[1].strip()
+        return text
+
+    # ---------- refreshing ----------
+
+    def _check_keys(self):
+        """A window that renders errors until someone opens a terminal is not a recovery tool."""
+        def done(ok, out):
+            if not ok:
+                return
+            try:
+                keys = json.loads(out)
+            except ValueError:
+                return
+            self.keys = keys
+            if keys.get("encryption_fpr") or self._first_run_shown:
+                return
+            if not keys.get("keyring_readable", True):
+                # cannot see a key is not the same as not having one. Offering to generate here
+                # is how a machine with fifteen live backups ends up with a brand new identity.
+                self._set_banner(
+                    "The key store cannot be read by this account (%s owns %s)"
+                    % (keys.get("keyring_owner") or "another user",
+                       keys.get("config_dir") or "it"))
+                return
+            self._first_run_shown = True
+            self._first_run()
+
+        run_async([TC, "keys", "--json"], done)
+
+    def _first_run(self):
+        dialog = Adw.AlertDialog(
+            heading="This machine has no key",
+            body="Backups are encrypted to a key that lives here and nowhere in the backups "
+                 "themselves.\n\nIf you are rebuilding a machine, bring the escrowed key back — "
+                 "generating a new one would leave every existing backup unreadable. If this is a "
+                 "genuinely new machine, set one up.")
+        dialog.add_response("later", "Later")
+        dialog.add_response("new", "Set up a new machine")
+        dialog.add_response("import", "Import an escrowed key")
+        dialog.set_response_appearance("import", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("import")
+        dialog.set_close_response("later")
+
+        def answered(_d, response):
+            if response == "import":
+                ImportKeyDialog(self, self.refresh).present(self)
+            elif response == "new":
+                self.log_line("$ timecrate init")
+
+                def done(ok, out):
+                    last = out.strip().splitlines()[-1] if out.strip() else ""
+                    # init refuses when the remote already holds kits -- that refusal IS the
+                    # feature, so it has to reach the operator, not the log alone
+                    if ok:
+                        self.toast("New key generated — export it for escrow now")
+                    else:
+                        self.report(self._clean(last) or "Could not set up a new key.")
+                    self.log_line(self._clean(last))
+                    self.refresh()
+
+                run_async([TC, "init"], done)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
+
+    def refresh(self):
+        run_async([TC, "status", "--json"], self._on_status)
+        run_async([TC, "list", "--long"], self._on_kits)
+        run_async([TC, "history", "--json"], self._on_history)
+        self._check_keys()
+
+    def _on_status(self, ok, out):
+        if not ok:
+            self.report("Cannot read status from %s. Is Timecrate installed?" % TC)
+            for row in (self.r_last, self.r_cloud, self.r_local, self.r_conf,
+                        self.r_cipher, self.r_key, self.r_escrow, self.r_drill):
+                row.set_subtitle("unknown")
+            for pill in (self.p_cloud, self.p_escrow, self.p_drill):
+                self._set_pill(pill, "UNKNOWN", "neutral")
+            return
+        try:
+            data = json.loads(out)
+        except ValueError:
+            self.report("Status was not valid JSON. See the log.")
+            self.log_line(out)
+            return
+
+        self.status = data
+        self.r_last.set_subtitle(self._last_backup_text(data.get("last_backup") or ""))
+
+        count = data.get("cloud_kits", "")
+        self.r_cloud.set_subtitle(data.get("remote") or "no remote configured")
+        # "" means the remote could not be read; "0" means it answered and holds nothing. Neither
+        # is success, and collapsing the two into a green "0 KITS" is exactly how an unreachable
+        # remote once looked healthy.
+        if count == "":
+            self._set_pill(self.p_cloud, "UNREADABLE", "error")
+        elif str(count) == "0":
+            self._set_pill(self.p_cloud, "NO BACKUPS", "error")
+        else:
+            self._set_pill(self.p_cloud,
+                           "%s KIT%s" % (count, "" if str(count) == "1" else "S"), "success")
+
+        # Space, stated only as far as it was actually measured: "" is not-measured, and saying
+        # "0 B" or "0% used" for a remote nobody could reach is the same lie the kit count used
+        # to tell.
+        extra = []
+        if data.get("cloud_bytes") not in ("", None):
+            extra.append("These backups total %s." % human_bytes(data.get("cloud_bytes")))
+        if data.get("remote_quota_total") not in ("", None):
+            extra.append("The remote holds %s of %s."
+                         % (human_bytes(data.get("remote_quota_used")),
+                            human_bytes(data.get("remote_quota_total"))))
+        self.kit_group.set_description(" ".join([self.KIT_GROUP_DESC] + extra))
+
+        local = data.get("local_kits", 0)
+        self.r_local.set_subtitle(
+            "none kept here — the archive is pruned after a verified upload" if not local
+            else "%d kept in %s — expected only if an upload failed"
+                 % (local, data.get("staging") or "the staging folder"))
+
+        sources = data.get("conf_sources") or []
+        self.r_conf.set_subtitle(", ".join(sources) if sources
+                                 else "built-in defaults only — nothing is configured")
+
+        self.r_cipher.set_subtitle(data.get("cipher") or "not reported")
+        fpr = data.get("key_fpr") or ""
+        self.r_key.set_subtitle("%s — %s" % (
+            data.get("keytype") or "not reported",
+            (fpr[:24] + "…") if len(fpr) > 24 else (fpr or "fingerprint missing")))
+
+        # Only claim what was actually proven. This used to assert a specific three-way escrow
+        # on the strength of any drill passing — including one that read the key off the very
+        # machine whose loss the escrow exists to survive.
+        if data.get("escrow_confirmed"):
+            self.r_escrow.set_subtitle("Marked as escrowed after a passing drill. Check that your "
+                                       "off-machine copies are still where you think they are.")
+            self._set_pill(self.p_escrow, "CONFIRMED", "success")
+        else:
+            self.r_escrow.set_subtitle("Not confirmed. If this key is lost the backups cannot be "
+                                       "read by anyone, including you.")
+            self._set_pill(self.p_escrow, "ACTION NEEDED", "warning")
+
+        drill_last = data.get("drill_last") or ""
+        self.r_drill.set_subtitle(("last: %s   " % drill_last if drill_last else "")
+                                  + "next: %s" % (data.get("drill_next") or "not scheduled"))
+        if "PASSED" in drill_last:
+            self._set_pill(self.p_drill, "PASSED", "success")
+        elif "FAILED" in drill_last:
+            self._set_pill(self.p_drill, "FAILED", "error")
+        else:
+            self._set_pill(self.p_drill, "NEVER RUN", "warning")
+
+    def _on_kits(self, ok, out):
+        self._clear_kits()
+        if not ok:
+            self.kit_names = []
+            detail = self._clean(out.strip().splitlines()[-1]) if out.strip() else ""
+            self.kit_error.set_description(
+                detail + "\n\nNothing can be restored from here until this is fixed. "
+                         "Check the remote with `timecrate config`.")
+            self.kit_stack.set_visible_child_name("error")
+            return
+
+        # `list --long` is "<bytes>\t<modtime>\t<name>", oldest first. Anything that does not
+        # split into three is treated as a bare name so a future column cannot empty this list --
+        # nothing to restore is the one thing this window must never say by accident.
+        kits = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3:
+                kits.append((parts[-1].strip(), parts[0].strip()))
+            else:
+                kits.append((line.strip(), ""))
+
+        self.kit_names = list(reversed([name for name, _ in kits]))
+        if not self.kit_names:
+            self.kit_stack.set_visible_child_name("empty")
+            return
+
+        # deviation is measured against the chronologically PREVIOUS kit, so it is computed on
+        # the oldest-first list and read back as the newest-first rows are built
+        deviations = {}
+        for index, (name, size) in enumerate(kits):
+            if index == 0 or not size.isdigit():
+                continue
+            prev = kits[index - 1][1]
+            if prev.isdigit() and int(prev) > 0:
+                deviations[name] = (int(size) - int(prev)) / int(prev)
+
+        sizes = dict(kits)
+        for filename in self.kit_names:
+            row = KitRow(filename, self._kit_display(filename), self.confirm_restore,
+                         size=sizes.get(filename, ""), deviation=deviations.get(filename))
+            row.set_busy(self.busy)
+            self.kit_rows.append(row)
+            self.kit_list.append(row)
+        self.kit_stack.set_visible_child_name("list")
+
+    def _clear_kits(self):
+        child = self.kit_list.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.kit_list.remove(child)
+            child = nxt
+        self.kit_rows = []
+
+    def _last_backup_text(self, value):
+        if not value:
+            return "none yet"
+        parts = value.split()
+        return ("%s  —  %s" % (self._kit_display(parts[-1]), parts[-1])
+                if len(parts) > 1 else value)
+
+    def _kit_display(self, filename):
+        match = KIT_RE.search(filename)
+        if not match:
+            return filename
+        try:
+            return datetime.strptime(match.group(1),
+                                     "%Y-%m-%d_%H-%M-%S").strftime("%b %-d, %Y · %H:%M")
+        except ValueError:
+            return filename
+
+    def _on_close_request(self, *_args):
+        if not self.busy:
+            return False
+        dialog = Adw.AlertDialog(
+            heading="Something is still running",
+            body="%s, with administrator privileges. Closing this window leaves it running with "
+                 "nothing watching it — and if it is a restore, mid-write. Wait for it to finish."
+                 % self._operation_name())
+        dialog.add_response("wait", "Keep Waiting")
+        dialog.add_response("close", "Close Anyway")
+        dialog.set_response_appearance("close", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("wait")
+        dialog.set_close_response("wait")
+        dialog.connect("response", lambda _d, resp: self.destroy() if resp == "close" else None)
+        dialog.present(self)
+        return True
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        (self.props.active_window or Window(self)).present()
+
+
+if __name__ == "__main__":
+    import sys
+
+    App().run(sys.argv)

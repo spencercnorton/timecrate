@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  SPDX-License-Identifier: GPL-2.0-or-later
+  Copyright 2026 Spencer Norton
+
+  Without this file pkexec still works, but the authentication dialog reads "Authentication is
+  required to run /usr/bin/timecrate as root", which tells the person at the keyboard nothing
+  about what is about to happen to their machine. Backup, restore and drill all run through the
+  same binary, so the message has to describe the tool honestly rather than any one operation.
+
+  auth_admin (not auth_admin_keep): every privileged run asks again. These are infrequent,
+  deliberate, high-consequence actions - one of them extracts an archive over the live system -
+  and a five-minute grace window on that is not a trade worth making.
+-->
+<policyconfig>
+  <vendor>Timecrate</vendor>
+  <vendor_url>https://github.com/spencercnorton/timecrate</vendor_url>
+
+  <action id="dev.norvi.Timecrate.run">
+    <description>Run a Timecrate backup, restore or recovery drill</description>
+    <message>Authentication is required to read your system's configuration and secrets for backup, or to restore them from an encrypted archive.</message>
+    <icon_name>dev.norvi.Timecrate</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/timecrate</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

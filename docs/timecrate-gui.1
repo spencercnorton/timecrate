@@ -1,0 +1,76 @@
+.TH TIMECRATE\-GUI 1 "2026-09-30" "timecrate 3.0.0" "User Commands"
+.SH NAME
+timecrate\-gui \- graphical front-end for Timecrate backups
+.SH SYNOPSIS
+.B timecrate\-gui
+.SH DESCRIPTION
+.B timecrate\-gui
+is a GTK4 and libadwaita front-end for
+.BR timecrate (1).
+It shows the live state of the backup \(em the archives held on the remote, when the last backup
+ran, whether the encryption key has been escrowed and whether the last recovery drill passed \(em
+and runs backups, restores and drills.
+.PP
+It is a front-end only. Every operation is carried out by
+.BR timecrate (1),
+whose output is shown verbatim in the activity log, and both read the same configuration.
+Anything done here can be done from the command line, and a machine with no graphical session
+loses no capability.
+.PP
+Operations that need root are run through
+.BR pkexec (1),
+so you are asked to authenticate each time. Cancelling that prompt cancels the operation and
+changes nothing.
+.SH RESTORING
+Selecting an archive fetches it, verifies its checksum and signature, decrypts it and extracts it
+into a staging directory for you to inspect. Your running system is not overwritten. Archives
+written before 3.0.0 are listed and restored the same way.
+.PP
+Under
+.BR "Checks and recovery" ,
+a bare\-metal restore extracts the newest archive straight over
+.I /
+after the same signature check, and only once you type
+.B RESTORE
+to confirm; break\-glass recovers from an archive already on disk, into a folder you choose.
+.SH REMOTE AND FOLDER
+The
+.B Remote and folder
+page shows where backups are written, which account they go to, whether the authorisation is still
+valid, whether the folder can be reached right now, and how much space the provider reports. From
+it you can connect or re-authorise a provider, test that the folder can be both listed and written
+to, browse the remote and choose a different folder, and make this machine forget the remote.
+.PP
+Choosing a folder does not take effect immediately: the backup count at both the current and the
+new location is shown first, because repointing away from a folder that holds backups leaves them
+in place and invisible. Forgetting a remote deletes nothing and does not revoke access at the
+provider.
+.SH KEYS AND RECOVERY
+The
+.B Keys and recovery
+page reports the encryption key, the signing key, whether their secret halves are on this
+machine, and whether the escrow has been confirmed for the key actually in use. From it you can
+import an escrowed key onto a rebuilt machine, check that this machine can read the backups,
+export the key for escrow, write a printable recovery sheet, and record that a copy exists
+off\-box. On a machine with no key at all, the window offers to restore an existing identity
+before it offers to generate a new one \(em generating one where backups already exist would leave
+them unreadable.
+.PP
+.B harden
+is reported here but not offered: its safety check is an interactive off\-box comparison that a
+process with no terminal cannot carry out, so a button could only skip it. Run it from
+.BR timecrate (1).
+.SH FILES
+.TP
+.I /etc/timecrate/timecrate.conf
+System configuration, shared with the command-line tool.
+.TP
+.I ~/.local/state/timecrate/status.json
+The status this window renders.
+.SH SEE ALSO
+.BR timecrate (1),
+.BR pkexec (1)
+.PP
+.I RESTORE.md
+in
+.IR /usr/share/doc/timecrate/

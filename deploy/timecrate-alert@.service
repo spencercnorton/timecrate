@@ -1,0 +1,8 @@
+[Unit]
+Description=Timecrate failure alert for %i
+Documentation=man:timecrate(1)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/timecrate.env
+ExecStart=/usr/libexec/timecrate/alert.sh --unit-failed %i

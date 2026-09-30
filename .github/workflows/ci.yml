@@ -1,0 +1,70 @@
+# Check and build on every pull request and on main, on the supported Ubuntu 26.04: the regression
+# suite (which includes the kits written before 3.0.0), the GUI smoke test, shellcheck, and both
+# packages built twice, compared byte for byte and held to lintian. A second job installs and
+# upgrades the packages under a real systemd. No secrets, read-only token, GitHub-owned actions
+# pinned by commit.
+name: CI
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    container: ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Container prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git ca-certificates python3 \
+            build-essential debhelper dpkg-dev lintian shellcheck
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Regression suite
+        run: bash tests/checks.sh
+      - name: GUI smoke test
+        run: bash tests/gui-smoke.sh
+      - name: Shell and Python
+        run: |
+          shellcheck -S warning -x -e SC1091,SC2029 timecrate deploy/*.sh tests/*.sh scripts/*.sh
+          python3 -m py_compile gui/timecrate-gui scripts/check_public_content.py scripts/test_public_content.py
+      - name: Build twice, compare, lintian
+        run: |
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/build.sh /tmp/one
+          scripts/build.sh /tmp/two
+          for f in /tmp/one/*.deb; do cmp "$f" "/tmp/two/$(basename "$f")"; done
+          lintian --fail-on error,warning /tmp/one/*.deb
+          mkdir -p dist/deb
+          cp /tmp/one/*.deb dist/deb/
+          (cd dist/deb && sha256sum *.deb > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: timecrate-debian-candidate
+          path: dist/deb/
+          if-no-files-found: error
+          retention-days: 14
+  package:
+    # the runner itself, not a container: this job starts a container whose PID 1 is systemd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install, use and upgrade the packages under systemd
+        run: bash tests/package.sh

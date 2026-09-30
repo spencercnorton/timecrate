@@ -1,0 +1,15 @@
+name: Feature request
+description: Suggest a change to what Timecrate backs up, how it proves recovery works, or how it tells you.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and why Timecrate gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose

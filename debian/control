@@ -1,0 +1,54 @@
+Source: timecrate
+Section: admin
+Priority: optional
+Maintainer: Norvi <apt@globalentry.systems>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/spencercnorton/timecrate
+
+Package: timecrate
+Architecture: all
+Depends: ${misc:Depends},
+         gnupg,
+         python3:any,
+         rclone,
+         zstd
+Recommends: qrencode
+Suggests: timecrate-gui
+Description: encrypted, signed off-site disaster-recovery backup
+ Timecrate ships the irreplaceable slice of a machine - configuration,
+ secrets, identity, hand-tuned state - to a cloud remote as a single
+ compressed, encrypted and signed archive. Bulk that can be reinstalled or
+ re-downloaded is deliberately left out; a manifest of installed packages,
+ enabled units and desktop settings rides along instead and is replayed at
+ restore time.
+ .
+ Every kit is signed as well as encrypted, and every path that extracts one
+ verifies that signature before writing a byte - so an attacker who gains write
+ access to the cloud remote cannot plant an archive that a restore would unpack
+ as root. Retention is grandfather-father-son, kits can be mirrored to a second
+ provider, and restoring an archive older than the newest recorded one is
+ refused unless you ask for it explicitly.
+ .
+ Recovery deliberately needs nothing but gpg, zstd and tar, so a restore does
+ not depend on this package being installable. A scheduled drill proves that
+ claim against a real archive using only the escrowed key. The backup, drill
+ and capstone timers are enabled on installation and kept across upgrades.
+
+Package: timecrate-gui
+Architecture: all
+Depends: ${misc:Depends},
+         timecrate (= ${binary:Version}),
+         gir1.2-adw-1,
+         gir1.2-gtk-4.0,
+         pkexec,
+         python3:any,
+         python3-gi
+Description: encrypted, signed off-site disaster-recovery backup (graphical interface)
+ A GTK4 and libadwaita front-end for Timecrate: run and watch a backup,
+ browse the archives held on the remote and restore one, run a recovery drill,
+ and edit the settings that the command-line tool reads.
+ .
+ This package is separate so that a headless machine can run backups without
+ pulling in a desktop stack.

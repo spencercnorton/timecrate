@@ -1,0 +1,62 @@
+# timecrate.exclude — junk to prune from inside the included paths. Installed to
+# /etc/timecrate/exclude and fed to `tar --exclude-from`.
+#
+# tar matching (verified): a bare name (.cache) matches at ANY depth; a relative path
+# (home/you/big/data) matches that exact subtree; never a leading slash; spaces are literal
+# (no quoting in this file). `~/` expands to the configured user's home, as in the include list.
+#
+# NOTE: the decryption keyring, the rclone token and the staging directory are excluded
+# automatically by the tool, from live config — they are not listed here and must not be
+# re-added. Deleting a line from this file can only cost you disk, never your key.
+
+# --- caches / build artifacts / VCS internals (match at any depth) ---
+.cache
+.npm
+node_modules
+__pycache__
+.venv
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.git
+*.pyc
+*.o
+.DS_Store
+
+# --- trash and thumbnails ---
+~/.local/share/Trash
+~/.thumbnails
+~/.cache
+
+# --- add your own bulk here, e.g. ---
+#~/Downloads
+#~/VirtualBox VMs
+
+# --- giants inside the included trees -----------------------------------------------------------
+# ~/.config is dominated by browser profiles (7.1G on the box this was measured on, of which 6.6G
+# was Chrome and Brave). Excluding them keeps the settings tree around 7M. ~/.config/Code/User
+# stays included — only caches are dropped, so VS Code settings survive.
+~/.config/google-chrome
+~/.config/google-chrome-headless
+~/.config/BraveSoftware
+~/.config/chromium
+~/.config/vivaldi
+~/.config/opera
+~/.config/microsoft-edge
+# Path-qualified, NOT bare names. `Cache`, `CachedData`, `blob_storage` and friends as unanchored
+# patterns apply to the WHOLE archive, so any directory named Cache under /usr/local, /etc or a
+# personal tree would be dropped silently — the exact class of quiet incompleteness the rest of
+# this tool exists to prevent, and it would have been invisible because the backup still succeeds.
+# Qualified this way the worst case is a slightly larger kit when an app adds a cache directory,
+# which is a failure direction you can see.
+~/.config/Code/Cache
+~/.config/Code/CachedData
+~/.config/Code/CachedExtensionVSIXs
+~/.config/Code/CachedProfilesData
+~/.config/Code/Code Cache
+~/.config/Code/GPUCache
+~/.config/Code/WebStorage
+~/.config/Code/logs
+~/.config/Code/blob_storage
+~/.config/Code/Service Worker
+~/.config/Code/Crashpad

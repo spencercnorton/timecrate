@@ -1,0 +1,79 @@
+# timecrate.include — what goes in the recovery kit. Installed to /etc/timecrate/include.
+#
+# One path per line, relative to / (no leading slash). `~/` expands to the configured user's
+# home, so this file stays correct if the username changes. Directories recurse fully;
+# timecrate.exclude prunes junk inside them. Blank lines and # comments are ignored.
+# A line containing * ? or [ is a shell glob, expanded at every backup (~/*.sh, ~/.app-*.env),
+# so files that appear later are picked up; one that matches nothing adds nothing.
+#
+# The point of this list is the IRREPLACEABLE slice of the box: things you cannot reinstall,
+# re-download or regenerate. Packages, caches and media do NOT belong here — a manifest of
+# installed packages is captured automatically and replayed at restore.
+#
+# Edit this file. The defaults below are a starting point, not a survey of your machine.
+# Preview what they actually select:   sudo timecrate backup --dry-run
+
+# --- System: small, precious, and outside any home directory ---
+etc
+root
+usr/share/keyrings
+
+# --- Secrets and identity — this is WHY the kit is encrypted ---
+~/.ssh
+~/.gnupg
+~/.gitconfig
+~/.config/rclone
+
+# --- Shell and local automation (usually in no git repo) ---
+~/.bashrc
+~/.profile
+~/.config/systemd/user
+~/.config/environment.d
+~/.local/bin
+
+# --- Desktop and application settings you hand-tuned ---
+~/.config/dconf/user
+
+# --- Your documents ---
+~/Documents
+
+# --- Uncomment if you use these ---
+#var/lib/tailscale
+#~/.docker/config.json
+#~/.config/Code/User
+#~/Pictures
+#~/work
+
+# --- OS-restore completeness -------------------------------------------------------------------
+# Custom binaries and libraries. By definition these come from no package, so the dpkg selections
+# replay cannot recreate them — on the first box audited this was the single largest hole.
+usr/local
+# Per-user display-manager settings (avatar, autologin, session choice).
+var/lib/AccountsService
+# The whole config tree, not a cherry-picked list. A hand-picked list means every NEW application's
+# settings are silently missed until someone happens to look; the audit that prompted this found
+# thirty-plus uncovered directories including autostart, goa-1.0 (online accounts), gtk-3.0/4.0 and
+# the desktop tooling. Browser profiles are excluded instead — see the exclude list.
+~/.config
+# Desktop integration and credential-adjacent state.
+~/.local/share/applications
+~/.local/share/gnome-shell
+~/.local/share/keyrings
+~/.local/share/icc
+~/.secrets
+~/.pki
+~/.face
+~/.bash_history
+
+# --- the tool itself ----------------------------------------------------------------------------
+# A kit must contain the thing that opens it. Nothing else guarantees it: once the tool is
+# installed from a package it lives in /usr, which no other line here names, and a restored
+# machine would come up without it -- or with whatever stale copy happened to be lying elsewhere.
+#
+# ~200 KB. It also removes a circular dependency from disaster recovery: without this, opening a kit
+# needs the package archive and a working network, which are part of what the kit exists to
+# survive the loss of.
+usr/bin/timecrate
+usr/bin/timecrate-gui
+usr/libexec/timecrate
+usr/share/timecrate

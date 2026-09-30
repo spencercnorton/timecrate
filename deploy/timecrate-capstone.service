@@ -1,0 +1,22 @@
+[Unit]
+Description=Timecrate quarterly capstone (rebuild a machine from a kit, in a real booted VM)
+Documentation=man:timecrate(1) https://github.com/spencercnorton/timecrate/blob/main/docs/RESTORE.md
+After=network-online.target
+Wants=network-online.target
+# systemd only honours OnFailure in [Unit]; in [Service] it is silently ignored and the quarterly
+# drill could fail and alert nobody.
+OnFailure=timecrate-alert@%n.service
+# The rebuild runs in a multipass VM. A machine without multipass cannot run it at all, so the
+# run is skipped there (systemctl status says the condition was not met) rather than failing
+# every quarter.
+ConditionPathExists=|/snap/bin/multipass
+ConditionPathExists=|/usr/bin/multipass
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/timecrate.env
+ExecStart=/usr/libexec/timecrate/capstone-and-alert.sh
+# a full rebuild installs a machine's packages in the VM; it is slow on purpose
+TimeoutStartSec=90min
+Nice=10
+IOSchedulingClass=idle

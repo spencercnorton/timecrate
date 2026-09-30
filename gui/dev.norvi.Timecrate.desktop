@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Timecrate
+GenericName=Encrypted Backup
+Comment=Lean, encrypted, off-site disaster-recovery backup
+Exec=timecrate-gui
+Icon=dev.norvi.Timecrate
+Terminal=false
+Categories=System;Utility;Archiving;
+Keywords=backup;restore;encrypt;cloud;disaster;recovery;
+StartupNotify=true
+StartupWMClass=dev.norvi.Timecrate
