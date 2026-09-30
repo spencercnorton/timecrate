@@ -1097,8 +1097,11 @@ export TIMECRATE_INCLUDE=/tmp/paths.inc
 "$TC" paths include add /var/lib/thing >/dev/null 2>&1
 grep -qx 'var/lib/thing' /tmp/paths.inc && ok "an absolute path is stored relative to /" \
   || no "add stored the wrong form: $(tail -2 /tmp/paths.inc | tr '\n' ' ')"
-# a home path becomes ~/ so the list survives a different username
-"$TC" paths include add "$HOME/Docs" >/dev/null 2>&1
+# a home path becomes ~/ so the list survives a different username. "Home" is the configured
+# user's, from passwd: the tool ignores $HOME, which a CI runner may point elsewhere (GitHub's
+# container jobs set /github/home for root).
+CONF_HOME=$(getent passwd "$(id -un)" | cut -d: -f6)
+"$TC" paths include add "$CONF_HOME/Docs" >/dev/null 2>&1
 # the list stores the literal two characters ~/ ; held in a variable so shellcheck does not read
 # it as a tilde that failed to expand (SC2088), which it would in any quoted literal
 TILDE='~'
