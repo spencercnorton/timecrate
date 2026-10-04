@@ -11,7 +11,7 @@
 # Break-glass needs only gpg + zstd + tar (see docs/BREAK-GLASS.md).
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 SELF="$(basename "$0")"
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
@@ -1282,6 +1282,20 @@ cmd_pause(){
   write_status || warn "the pause IS set, but refreshing $STATE_DIR/status.json failed — the window may show stale state until the next run"
 }
 
+# A private work dir on disk-backed space, never /tmp: a whole kit is fetched and decrypted
+# there, and on current Ubuntu /tmp is a tmpfs of half the RAM that a kit outgrows.
+disk_workdir(){
+  local workroot=""
+  if [ -d "$STAGING_ROOT" ] && [ -w "$STAGING_ROOT" ]; then
+    workroot="$STAGING_ROOT"
+  else
+    workroot="${XDG_CACHE_HOME:-$HOME/.cache}/timecrate"
+    mkdir -p "$workroot" || die "staging ($STAGING_ROOT) is not usable as $(id -un) and $workroot could not be created either"
+  fi
+  local d; d="$(mktemp -d "$workroot/.$1.XXXX")" || die "cannot create a work dir under $workroot"
+  chmod 700 "$d"; printf '%s\n' "$d"
+}
+
 cmd_verify(){
   local pos="" remote=0 all=0
   while [ $# -gt 0 ]; do case "$1" in
@@ -1327,15 +1341,7 @@ cmd_verify(){
   # this fallback — breaking the exact case the fallback is for. My own live check missed it
   # because I had already created the directory with sudo while testing.
   #
-  # Disk-backed, not /tmp: a kit does not fit in a small tmpfs.
-  local workroot=""
-  if [ -d "$STAGING_ROOT" ] && [ -w "$STAGING_ROOT" ]; then
-    workroot="$STAGING_ROOT"
-  else
-    workroot="${XDG_CACHE_HOME:-$HOME/.cache}/timecrate"
-    mkdir -p "$workroot" || die "staging ($STAGING_ROOT) is not usable as $(id -un) and $workroot could not be created either"
-  fi
-  local work; work="$(mktemp -d "$workroot/.verify.XXXX")"; TC_TMP="$work"
+  local work; work="$(disk_workdir verify)" || die "no disk-backed work dir for verify"; TC_TMP="$work"
   trap 'rm -rf -- "$TC_TMP"' EXIT
   local total=0 good=0 bad="" f
   while read -r f; do
@@ -1802,7 +1808,7 @@ cmd_recovery_drill(){
   local keyfile="${1:-$SECRET_ESCROW}" ts="${2:-}"
   [ -f "$keyfile" ] || die "usage: $SELF recovery-drill [<escrow-key.asc>] [<ts>]  (default key: $SECRET_ESCROW)"
   require_tools cloud
-  local t; t="$(mktemp -d)"; TC_TMP="$t"; trap 'rm -rf -- "$TC_TMP"' EXIT
+  local t; t="$(disk_workdir drill)" || die "no disk-backed work dir for the drill"; TC_TMP="$t"; trap 'rm -rf -- "$TC_TMP"' EXIT
   export GNUPGHOME="$t/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
   log "importing ONLY the escrowed key into a throwaway keyring (simulating a wiped OS)…"
   gpg --batch --import "$keyfile" 2>/dev/null || die "could not import key from '$keyfile'"

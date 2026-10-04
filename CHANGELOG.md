@@ -2,6 +2,32 @@
 
 All notable changes to Timecrate are documented here.
 
+## 3.0.1 — 2026-10-04
+
+- **The capstone decrypts on disk, and fails closed.** It decrypted the kit into `/tmp`, which on
+  Ubuntu 26.04 is a tmpfs of half the RAM: under 1 GiB in the capstone's VM, smaller than a kit.
+  The decrypt ran out of space without a signature record, and the run took that for a kit made
+  before signing and carried on. The kit is now decrypted beside itself on the VM's disk and
+  deleted once verified; a clean decryption with a valid signature from the staged signing key is
+  required before anything is extracted; zstd and tar must both exit cleanly and the manifests must
+  come out, or the run stops there.
+- **Nothing absent counts as a pass.** An empty package sample, a kit without package selections,
+  and desktop settings that read back no keys are failures. The settings read-back loaded a path
+  that did not exist; it now loads the restored file.
+- **The capstone's reboot is the guest's own.** `multipass restart` could wait out its whole bound
+  while the guest had booted normally. The guest now reboots itself and only an answer from a new
+  boot counts; if none comes, one forced stop and start follows, and the alert carries what the
+  boot before it logged and which units failed, so a guest that cannot boot reads differently from
+  a hypervisor that lost track of it. The reboot follows only a recovery that passed, so a failed
+  one is not reported a second time as a reboot failure.
+- A capstone alert lists every failed check, not only the first.
+- **`verify` and `recovery-drill` work on disk too.** The recovery drill fetched and decrypted a
+  kit under a bare `mktemp -d`, which is the same tmpfs `/tmp`; on a host with little RAM it would
+  fail exactly as the capstone did. Both commands now share one disk-backed work-dir helper.
+- [docs/BREAK-GLASS.md](docs/BREAK-GLASS.md): decrypt where there is room for about twice the kit,
+  not in a tmpfs `/tmp`; a decrypt that runs out of space shows no signature, which is not a sign
+  of tampering.
+
 ## 3.0.0 — 2026-09-30
 
 The first public release, and a new name: releases before it were packaged as `time-machine` and

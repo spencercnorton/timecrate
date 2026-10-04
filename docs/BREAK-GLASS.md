@@ -41,13 +41,20 @@ extract:
 ```sh
 gpg --status-file st.txt -o kit.tar.zst -d timecrate-<ts>.tar.zst.gpg
 grep VALIDSIG st.txt    # MUST print a line with the signing fingerprint from the escrow sheet.
-                        # No VALIDSIG means a forged or tampered kit: STOP.
+                        # No VALIDSIG means a forged or tampered kit: STOP
+                        # (unless gpg failed for lack of space: see below).
                         # (The tool refuses an unpinned signature the same way; to pin one
                         #  explicitly, pass TIMECRATE_EXPECT_SIGNER=<fingerprint from the sheet>.)
 mkdir -p restore        # inspect first: extract into ./restore
 zstd -dc --long=27 < kit.tar.zst \
   | sudo tar --numeric-owner --acls --xattrs -xpf - -C restore
 ```
+
+Decrypt on disk-backed space with room for about twice the kit, such as your home directory or
+`/var/tmp`, and extract where there is room for the uncompressed contents as well: on a modern
+Ubuntu `/tmp` is a RAM-backed tmpfs that cannot hold a kit. A decrypt that runs out of space ends
+without a `VALIDSIG` line, and that is not evidence of tampering: check the free space (`df -h .`)
+and gpg's own error first, then decrypt again where there is room.
 
 `--long=27` matches the 128 MiB window the kit was compressed with and needs only about 128 MB of
 memory, so recovery works on a small rescue machine.
