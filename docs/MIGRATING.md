@@ -117,7 +117,7 @@ against it exactly as the old version would have.
 ## 5. Install Timecrate
 
 ```sh
-sudo apt install -o Dpkg::Options::=--force-confold ./timecrate_3.0.0_all.deb ./timecrate-gui_3.0.0_all.deb
+sudo apt install -o Dpkg::Options::=--force-confold ./timecrate_*_all.deb ./timecrate-gui_*_all.deb
 ```
 
 `--force-confold` keeps the files you wrote in step 2, and puts the package's own versions beside

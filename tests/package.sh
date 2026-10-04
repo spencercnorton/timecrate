@@ -9,8 +9,8 @@
 #     installed units as well as by hand, and a failure reaches the alert command twice (from the
 #     run, and from OnFailure=)
 #   - the window starts headless against the installed engine and a real remote
-#   - an upgrade (3.0.0 -> 3.0.0+test1) leaves every timer enabled and running, and a timer the
-#     administrator disabled stays disabled
+#   - an upgrade (<version> -> <version>+test1) leaves every timer enabled and running, and a timer
+#     the administrator disabled stays disabled
 #   - and, as the control, that a package built the pre-3.0.0 way (--no-enable --no-start)
 #     leaves the timers stopped after the same upgrade -- so the check above can fail.
 #
@@ -26,12 +26,14 @@ no(){ echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 inside(){
   export DEBIAN_FRONTEND=noninteractive
-  echo "== P0: build 3.0.0, 3.0.0+test1, and a control built the pre-3.0.0 way =="
+  # the version this tree builds as, so a release bump needs no edit here
+  V="$(sed -n '1s/^timecrate (\([^)]*\)).*/\1/p' /src/debian/changelog)"
+  echo "== P0: build $V, $V+test1, and a control built the pre-3.0.0 way =="
   apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends \
     debhelper dpkg-dev sudo xvfb xauth ca-certificates >/dev/null || { no "build tools not installable"; return; }
   build(){   # <name> <version> [old-rules]
     local d="/build/$1"; rm -rf "$d"; mkdir -p /build; cp -a /src "$d"
-    sed -i "1s/(3\.0\.0)/($2)/" "$d/debian/changelog"
+    sed -i "1s/([^)]*)/($2)/" "$d/debian/changelog"
     [ -n "${3:-}" ] && sed -i 's/^\tdh_installsystemd --restart-after-upgrade$/\tdh_installsystemd --no-enable --no-start/' "$d/debian/rules"
     (cd "$d" && dpkg-buildpackage -us -uc -b -d >/dev/null 2>&1) || { no "build of $2 failed"; return 1; }
     ls /build/timecrate_"$2"_all.deb /build/timecrate-gui_"$2"_all.deb >/dev/null
@@ -39,13 +41,13 @@ inside(){
   if [ -n "${DEBS:-}" ]; then
     A="$(ls /debs/timecrate_*_all.deb)"; AG="$(ls /debs/timecrate-gui_*_all.deb)"
   else
-    build a 3.0.0 && A=/build/timecrate_3.0.0_all.deb AG=/build/timecrate-gui_3.0.0_all.deb
+    build a "$V" && A="/build/timecrate_${V}_all.deb" AG="/build/timecrate-gui_${V}_all.deb"
   fi
-  build b 3.0.0+test1 && build c 3.0.0+test2 old-rules || return
-  dpkg-deb --ctrl-tarfile /build/timecrate_3.0.0+test1_all.deb | tar -xO ./preinst 2>/dev/null \
+  build b "$V+test1" && build c "$V+test2" old-rules || return
+  dpkg-deb --ctrl-tarfile "/build/timecrate_$V+test1_all.deb" | tar -xO ./preinst 2>/dev/null \
     | grep -q 'deb-systemd-invoke stop' \
     && no "the new preinst stops units on upgrade" || ok "the preinst of an upgrade stops nothing"
-  dpkg-deb --ctrl-tarfile /build/timecrate_3.0.0+test2_all.deb | tar -xO ./preinst 2>/dev/null \
+  dpkg-deb --ctrl-tarfile "/build/timecrate_$V+test2_all.deb" | tar -xO ./preinst 2>/dev/null \
     | grep -q 'deb-systemd-invoke stop' \
     && ok "(control) the pre-3.0.0 rules do put a stop in preinst" || no "the control build has no preinst stop -- the check proves nothing"
 
@@ -156,9 +158,9 @@ PY
 
   echo "== P5: an upgrade keeps the timers running; a disabled one stays disabled =="
   systemctl disable --now timecrate-drill.timer >/dev/null 2>&1
-  apt-get install -y -qq /build/timecrate_3.0.0+test1_all.deb /build/timecrate-gui_3.0.0+test1_all.deb >/tmp/p5.out 2>&1 \
+  apt-get install -y -qq "/build/timecrate_$V+test1_all.deb" "/build/timecrate-gui_$V+test1_all.deb" >/tmp/p5.out 2>&1 \
     || { no "upgrade failed: $(tail -3 /tmp/p5.out)"; return; }
-  [ "$(dpkg-query -W -f '${Version}' timecrate)" = 3.0.0+test1 ] && ok "upgraded to 3.0.0+test1" || no "not upgraded"
+  [ "$(dpkg-query -W -f '${Version}' timecrate)" = "$V+test1" ] && ok "upgraded to $V+test1" || no "not upgraded"
   for t in backup capstone; do
     [ "$(systemctl is-enabled "timecrate-$t.timer")" = enabled ] && [ "$(systemctl is-active "timecrate-$t.timer")" = active ] \
       && ok "timecrate-$t.timer is still enabled and running after the upgrade" \
@@ -175,7 +177,7 @@ PY
   [ -e /usr/sbin/policy-rc.d ] && no "policy-rc.d is present, so no package script can start anything and P1/P5 prove nothing"
   systemctl is-active --quiet timecrate-backup.timer \
     || no "(control) the backup timer was not running before the control upgrade -- the control proves nothing"
-  apt-get install -y -qq /build/timecrate_3.0.0+test2_all.deb /build/timecrate-gui_3.0.0+test2_all.deb >/dev/null 2>&1
+  apt-get install -y -qq "/build/timecrate_$V+test2_all.deb" "/build/timecrate-gui_$V+test2_all.deb" >/dev/null 2>&1
   if systemctl is-active --quiet timecrate-backup.timer; then
     no "the control upgrade left the timer running -- P5 does not prove the fix"
   else

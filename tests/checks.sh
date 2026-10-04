@@ -2475,6 +2475,12 @@ tvers="$(printf '%s\n' "$vers" | head -1)"
 [ "$evers" = "$tvers" ] \
   && ok "and the engine version matches the top changelog entry ($evers)" \
   || no "engine says $evers, changelog says $tvers — the tag pipeline asserts these agree"
+# The man pages print the version in their footer; nothing in the release pipeline reads them.
+for man57 in "$REPO"/docs/*.1; do
+  grep -qE "^\.TH .* \"timecrate $evers\" " "$man57" \
+    && ok "$(basename "$man57") names $evers in its .TH line" \
+    || no "$(basename "$man57") .TH does not name timecrate $evers: $(head -1 "$man57")"
+done
 
 echo "== T58: a kit contains the tool that opens it (v2.14.0) =="
 # Once the tool is installed from a package it lives in /usr, which nothing else in the list

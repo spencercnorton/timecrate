@@ -1,3 +1,15 @@
+timecrate (3.0.1) resolute; urgency=medium
+
+  * The quarterly capstone decrypts the kit on disk instead of /tmp, which
+    is a small tmpfs on Ubuntu 26.04, and fails when the kit is not
+    authenticated or does not extract whole, instead of passing it as
+    unsigned. A missing package sample, package selections or desktop
+    settings fail the run too. The guest reboots itself for the reboot
+    check, a forced stop and start tells a guest that cannot boot from a
+    hypervisor that lost track of it, and the alert lists every failure.
+
+ -- Norvi <apt@globalentry.systems>  Sun, 04 Oct 2026 00:00:00 +0000
+
 timecrate (3.0.0) resolute; urgency=medium
 
   * First public release, under the name Timecrate. Kits written by earlier
