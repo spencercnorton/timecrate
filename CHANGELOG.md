@@ -21,6 +21,9 @@ All notable changes to Timecrate are documented here.
   a hypervisor that lost track of it. The reboot follows only a recovery that passed, so a failed
   one is not reported a second time as a reboot failure.
 - A capstone alert lists every failed check, not only the first.
+- **`verify` and `recovery-drill` work on disk too.** The recovery drill fetched and decrypted a
+  kit under a bare `mktemp -d`, which is the same tmpfs `/tmp`; on a host with little RAM it would
+  fail exactly as the capstone did. Both commands now share one disk-backed work-dir helper.
 - [docs/BREAK-GLASS.md](docs/BREAK-GLASS.md): decrypt where there is room for about twice the kit,
   not in a tmpfs `/tmp`; a decrypt that runs out of space shows no signature, which is not a sign
   of tampering.

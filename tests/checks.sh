@@ -2793,6 +2793,15 @@ printf '%s\n' "$code64" | grep -q 'DECRYPTION_OKAY' && printf '%s\n' "$code64" |
 printf '%s\n' "$code64" | grep -qE "bash -c '[^']*[\$]M" \
   && no "a single-quoted bash -c reads \$M, which is unset in the child shell" \
   || ok "and no single-quoted child shell reads a variable it does not have"
+# The engine's own kit-fetching commands have the same exposure: verify and recovery-drill pull a
+# whole kit and decrypt it in their work dir, so that dir must not be a bare mktemp -d (/tmp).
+for fn64 in cmd_verify cmd_recovery_drill; do
+  body64="$(sed -n "/^$fn64(){/,/^}/p" "$REPO/timecrate")"
+  if [ -z "$body64" ]; then no "$fn64 not found in the engine — this check no longer sees it"
+  elif printf '%s\n' "$body64" | grep -q 'disk_workdir' && ! printf '%s\n' "$body64" | grep -qE 'mktemp -d\)'; then
+    ok "$fn64 fetches and decrypts kits in a disk-backed work dir"
+  else no "$fn64 works in a bare mktemp -d, which is /tmp — a tmpfs smaller than a kit"; fi
+done
 
 # The same script, run: a kit with no signature must stop it before anything is extracted, and a
 # signed one must still pass. It installs packages and writes under /etc, as it does in the VM.
