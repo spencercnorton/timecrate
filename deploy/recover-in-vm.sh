@@ -11,6 +11,7 @@ export DEBIAN_FRONTEND=noninteractive
 PASS=0; FAIL=0
 ok(){ echo "  [PASS] $*"; PASS=$((PASS+1)); }
 no(){ echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
+result(){ echo "==== IN-VM RESULT: $PASS PASS / $FAIL FAIL ===="; [ "$FAIL" -eq 0 ]; exit; }
 IN=/home/ubuntu/timecrate-in
 KIT=$IN/kit.tar.zst.gpg; KEY=$IN/escrow-key.asc
 MARK=/etc/timecrate-capstone-marker
@@ -59,17 +60,39 @@ exp=$(awk '{print $1}' "$IN/kit.sha256" 2>/dev/null); act=$(sha256sum "$KIT" | a
 [ -n "$exp" ] && [ "$exp" = "$act" ] && ok "sha256 matches" || no "sha256 mismatch"
 
 echo "S4: break-glass decrypt -> VERIFY SIGNATURE -> decompress -> extract"
+# The plaintext goes beside the kit, on the VM's disk, and never to /tmp: Ubuntu 26.04 mounts /tmp
+# as a tmpfs of half the RAM, under 1 GiB on this VM, and a kit is bigger than that. A decrypt that
+# runs out of space ends with no signature record at all, and the version before this read that as
+# "the kit predates signing", passed, and went on to extract a truncated archive.
+DEC=$IN/kit.tar.zst; ST=$IN/gpg-status
 mkdir -p /restore
-[ -f "$IN/signing-pub.asc" ] && gpg --batch --import "$IN/signing-pub.asc" >/dev/null 2>&1
-gpg --batch --no-tty --yes --status-file /tmp/gpgst -o /tmp/kit.tar.zst -d "$KIT" 2>/dev/null
-if grep -q '^\[GNUPG:\] VALIDSIG ' /tmp/gpgst; then ok "kit signature VALIDSIG (authenticated before extract)"
-elif grep -q '^\[GNUPG:\] ERRSIG ' /tmp/gpgst; then no "kit IS signed but signing-pub.asc was not staged — VALIDSIG impossible"
-else echo "  (kit is unsigned — pre-v1.3.0; signature check n/a)"; fi
-zstd -dc --long=27 < /tmp/kit.tar.zst 2>/dev/null | tar --numeric-owner -xpf - -C /restore 2>/dev/null
-rm -f /tmp/kit.tar.zst
-[ -f /restore/etc/fstab ] && ok "extracted ($(find /restore/etc -type f | wc -l) /etc files)" || no "extract failed"
-# the manifests directory is named after the tool that wrote the kit
+want=$(gpg --batch --show-keys --with-colons "$IN/signing-pub.asc" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')
+gpg --batch --import "$IN/signing-pub.asc" >/dev/null 2>&1
+grc=0; gpg --batch --no-tty --yes --status-file "$ST" -o "$DEC" -d "$KIT" 2>"$IN/gpg.err" || grc=$?
+got=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' "$ST" 2>/dev/null)
+# As the engine decides it: a clean exit, a completed decryption, and a valid signature by the
+# staged signing key. Anything else, no signature record at all included, fails, and nothing is
+# extracted. Every kit since v1.3.0 is signed.
+if [ "$grc" = 0 ] && grep -q '^\[GNUPG:\] DECRYPTION_OKAY' "$ST" && [ -n "$want" ] && [ "$got" = "$want" ]; then
+  ok "kit decrypted, signed by $got (authenticated before extract)"
+  rm -f "$KIT"   # checked and decrypted: its space goes to the extract and the packages
+else
+  no "kit NOT authenticated, nothing extracted (gpg=$grc, signer ${got:-none}, expected ${want:-none, no signing-pub.asc}): $(grep '^gpg: ' "$IN/gpg.err" 2>/dev/null | tail -1) [$(df -h "$IN" | awk 'NR==2{print $4}') free on $IN]"
+  rm -f "$DEC"; result
+fi
+zstd -dc --long=27 < "$DEC" 2>"$IN/zstd.err" | tar --numeric-owner -xpf - -C /restore 2>"$IN/tar.err"
+x=("${PIPESTATUS[@]}")
+rm -f "$DEC"
+# The manifests directory is named after the tool that wrote the kit, and the engine writes it
+# LAST: both stages exiting clean with the manifests present is what proves the whole kit came out.
 M=/restore/TIMECRATE-MANIFESTS; [ -d "$M" ] || M=/restore/TIMEMACHINE-MANIFESTS
+if [ "${x[0]}" = 0 ] && [ "${x[1]}" = 0 ] && [ -d "$M" ]; then
+  ok "extracted ($(find /restore/etc -type f 2>/dev/null | wc -l) /etc files, and ${M#/restore/})"
+else
+  err=$(cat "$IN/zstd.err" "$IN/tar.err" 2>/dev/null | tail -1)
+  no "extract failed (zstd=${x[0]} tar=${x[1]}, manifests $([ -d "$M" ] && echo present || echo MISSING))${err:+: $err}"
+  result
+fi
 
 echo "S5: restore apt sources + keyrings, apt update, then REALLY install a sample of manual packages"
 cp -a /restore/etc/apt/sources.list /etc/apt/ 2>/dev/null || true
@@ -81,8 +104,10 @@ cp -a /restore/etc/apt/keyrings/. /etc/apt/keyrings/ 2>/dev/null || true
 apt-get update -qq >/tmp/upd 2>&1 && ok "apt update OK (base + 3rd-party repos)" || no "apt update: $(grep -iE 'NO_PUBKEY|Err:' /tmp/upd | head -1)"
 # Ubuntu 26.04 sources are deb822 (.sources with Signed-By:) — prove the restored tree carries them
 ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1 && ok "deb822 .sources restored" || no "no deb822 .sources in restored apt tree"
-SAMPLE=$(comm -12 <(sort $M/apt-manual.txt) <(apt-cache pkgnames | sort) | grep -vE '^(linux-|nvidia-|steam)' | head -8 | tr '\n' ' ')
-if apt-get install -y -qq --no-install-recommends $SAMPLE >/tmp/inst 2>&1; then ok "actually installed: $SAMPLE"; else no "sample install failed: $(tail -1 /tmp/inst)"; fi
+SAMPLE=$(comm -12 <(sort "$M/apt-manual.txt") <(apt-cache pkgnames | sort) | grep -vE '^(linux-|nvidia-|steam)' | head -8 | tr '\n' ' ')
+# an empty sample installs nothing, successfully
+if [ -z "$SAMPLE" ]; then no "no installable package from $M/apt-manual.txt — nothing to prove the restored sources with"
+elif apt-get install -y -qq --no-install-recommends $SAMPLE >/tmp/inst 2>&1; then ok "actually installed: $SAMPLE"; else no "sample install failed: $(tail -1 /tmp/inst)"; fi
 
 echo "S5b: package replay EXACTLY as the runbook documents (merge-avail -> set-selections -> dselect-upgrade)"
 # this is the path RESTORE.md tells a human to type — if a doc regression breaks it
@@ -90,30 +115,32 @@ echo "S5b: package replay EXACTLY as the runbook documents (merge-avail -> set-s
 # Foreign architectures first, exactly as the runbook now says. Without this the replay does not
 # degrade, it ABORTS: one selected package with an unavailable i386 dependency makes apt refuse the
 # whole transaction and plan zero installs. That is what this step caught on 2026-08-02.
-if [ -s $M/dpkg-foreign-architectures.txt ]; then
+if [ -s "$M/dpkg-foreign-architectures.txt" ]; then
   while read -r a; do [ -n "$a" ] && dpkg --add-architecture "$a"; done \
-    < $M/dpkg-foreign-architectures.txt
+    < "$M/dpkg-foreign-architectures.txt"
   apt-get update -qq >/dev/null 2>&1
-  ok "replayed foreign architectures: $(tr '\n' ' ' < $M/dpkg-foreign-architectures.txt)"
+  ok "replayed foreign architectures: $(tr '\n' ' ' < "$M/dpkg-foreign-architectures.txt")"
 else
   # Kits written before v2.8.0 carry no foreign-architecture manifest, and on 2026-08-04 that was
   # THIRTEEN of the fifteen kits on the remote — every one of which would replay zero packages.
   # The information is still in the kit though: dpkg records a foreign arch as a `:arch` suffix in
   # the selections, so derive it from there rather than abandoning the replay. Found by the first
   # real run of the oldest-kit capstone, on the 2026-07-22 kit, which planned 0 installs.
-  derived="$(awk '{print $1}' $M/dpkg-selections.txt 2>/dev/null \
+  derived="$(awk '{print $1}' "$M/dpkg-selections.txt" 2>/dev/null \
              | sed -n 's/.*:\([a-z0-9][a-z0-9-]*\)$/\1/p' | sort -u \
              | grep -vx "$(dpkg --print-architecture)" || true)"
   if [ -n "$derived" ]; then
     for a in $derived; do dpkg --add-architecture "$a"; done
     apt-get update -qq >/dev/null 2>&1
     ok "no foreign-arch manifest (pre-v2.8.0 kit) — derived from selections: $(echo "$derived" | tr '\n' ' ')"
-  else
+  elif [ -s "$M/dpkg-selections.txt" ]; then
     ok "no foreign-arch manifest, and no foreign-arch package in the selections — nothing to replay"
   fi
 fi
+# no selections means no foreign architectures either, and nothing to replay: that is a failure
+[ -s "$M/dpkg-selections.txt" ] || no "the kit carries no dpkg-selections.txt — there is no package set to replay"
 apt-cache dumpavail | dpkg --merge-avail >/dev/null 2>&1
-dpkg --set-selections < $M/dpkg-selections.txt 2>/tmp/sel || true
+dpkg --set-selections < "$M/dpkg-selections.txt" 2>/tmp/sel || true
 # A simulation (-s) on purpose: it catches the merge-avail/set-selections class of regression, not
 # real install failures. A whole machine's packages would not fit a 2 GB VM; if that assurance is
 # ever needed, it takes a bigger VM and a real dselect-upgrade.
@@ -128,9 +155,11 @@ else
 fi
 
 echo "S6: dconf load on a real dbus session + read back"
-if dbus-run-session -- dconf load / < $M/dconf.ini 2>/tmp/dconf; then
-  n=$(dbus-run-session -- bash -c 'dconf load / < $M/dconf.ini; dconf dump /' 2>/dev/null | grep -c '=')
-  ok "dconf load OK (${n} keys round-tripped)"
+if dbus-run-session -- dconf load / < "$M/dconf.ini" 2>/tmp/dconf; then
+  # The path goes in as $1. Written inside the single quotes, $M belonged to the child shell, where
+  # it is unset: the read-back loaded /dconf.ini, which does not exist, and counted a fresh session.
+  n=$(dbus-run-session -- bash -c 'dconf load / < "$1" && dconf dump /' _ "$M/dconf.ini" 2>/dev/null | grep -c '=')
+  [ "${n:-0}" -gt 0 ] && ok "dconf load OK (${n} keys round-tripped)" || no "dconf load read back no keys from $M/dconf.ini"
 else no "dconf load failed: $(tail -1 /tmp/dconf)"; fi
 
 echo "S7: apply non-boot-critical /etc (sysctl.d, modprobe.d) — the reboot-survival test"
@@ -143,5 +172,4 @@ n="$(grep -c . "$RESTORED" || true)"
 [ "${n:-0}" -gt 0 ] && ok "restored $n sysctl.d/modprobe.d file(s) and left a marker for the reboot check" \
   || no "the kit carried no /etc/sysctl.d or /etc/modprobe.d to restore"
 
-echo "==== IN-VM RESULT: $PASS PASS / $FAIL FAIL ===="
-[ "$FAIL" -eq 0 ]
+result

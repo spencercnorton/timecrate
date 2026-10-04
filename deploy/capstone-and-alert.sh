@@ -188,6 +188,9 @@ trap cleanup EXIT
 trap 'on_signal INT'  INT
 trap 'on_signal TERM' TERM
 
+# Every [FAIL] line of a run, joined: the first one alone is often a consequence, not the cause.
+fail_lines(){ printf '%s\n' "$1" | awk '/\[FAIL\]/{sub(/^ *\[FAIL\] /, ""); printf "%s%s", s, $0; s="; "}'; }
+
 # Copy into the VM and verify by SIZE at the destination. `multipass transfer` has returned zero
 # for a source that does not exist, so its exit code proves nothing.
 vm_put(){
@@ -343,25 +346,50 @@ if [ -z "$problem" ]; then
   OUT="$(mp exec "$VM" -- sudo bash /home/ubuntu/recover-in-vm.sh 2>&1)"
   printf '%s\n' "$OUT"
   printf '%s' "$OUT" | grep -qE '^==== IN-VM RESULT: [0-9]+ PASS / 0 FAIL' \
-    || fail "in-VM recovery FAILED ($(printf '%s' "$OUT" | grep -c '\[FAIL\]') checks): $(printf '%s' "$OUT" | grep '\[FAIL\]' | head -1)"
+    || fail "in-VM recovery FAILED ($(printf '%s' "$OUT" | grep -c '\[FAIL\]') checks): $(fail_lines "$OUT")"
+fi
 
+# Only after a clean in-VM run: a recovery that stopped early wrote no marker, so the reboot would
+# cost minutes and add a second, false cause to an alert that already has the real one.
+if [ -z "$problem" ]; then
   # reboot survival: restored config that does not outlive a boot has not been restored
-  mp restart "$VM" >/dev/null 2>&1 || fail "VM would not restart after the restore"
-  # Wait for the guest to ANSWER, the same way the launch does, instead of sleeping a fixed 20s.
-  # A blind sleep calls a slow-but-healthy reboot a failure and a wedged guest a success; on
-  # 2026-08-04 the instance sat in "Restarting" indefinitely and the run simply waited.
-  rebooted=0
-  # 36 x 5s = 3 min, well past a normal cloud-image boot. Tunable only so the suite can drive the
-  # never-answers path in seconds instead of minutes.
-  for _ in $(seq 1 "${TIMECRATE_CAPSTONE_REBOOT_TRIES:-36}"); do
-    if mp_probe exec "$VM" -- true >/dev/null 2>&1; then rebooted=1; break; fi
-    sleep 5
-  done
-  if [ "$rebooted" != 1 ]; then
-    # Do NOT go on to question a guest that has already been established as not answering: that
-    # read carries the long mp() bound and would sit on a wedged daemon for another 15 minutes,
-    # re-earning the hang the loop above exists to prevent.
-    fail "the VM never answered after its reboot (wedged, not slow)"
+  #
+  # The guest reboots itself; `multipass restart` is not used. Its wait for the daemon's own SSH
+  # session has run to the full bound while the guest booted normally and kept time, and before
+  # the bound existed it hung for thirty hours. The session drops as the guest goes down, so the
+  # exit status of the request means nothing: what counts is a guest answering from a NEW boot.
+  # Only a well-formed id counts, so stray output from multipass can never pass for a new boot.
+  boot_id(){ mp_probe exec "$VM" -- cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r' \
+               | grep -m1 -xE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'; }
+  # 36 x (probe + 5s), well past a normal cloud-image boot. Tunable only so the suite can drive the
+  # never-answers path in seconds instead of minutes. A probe has its own short bound: at the 900s
+  # mp() default the same loop against a wedged daemon would take nine hours.
+  await_boot(){
+    for _ in $(seq 1 "${TIMECRATE_CAPSTONE_REBOOT_TRIES:-36}"); do
+      now="$(boot_id)"
+      [ -n "$now" ] && [ "$now" != "$1" ] && return 0
+      sleep 5
+    done
+    return 1
+  }
+  # A few tries: one dropped probe here would otherwise read as a failed capstone.
+  for _ in 1 2 3; do before="$(boot_id)"; [ -n "$before" ] && break; sleep 5; done
+  [ -n "$before" ] && mp_probe exec "$VM" -- sudo systemctl reboot >/dev/null 2>&1
+  if [ -z "$before" ]; then
+    fail "the VM did not report its boot id before the reboot, so a reboot could not be told from no reboot"
+  elif ! await_boot "$before"; then
+    # One forced power cycle, to tell the two causes apart: a guest the restored configuration
+    # will not let boot, and a guest that booted while multipass lost its way back in. Only a
+    # short-bounded read follows, and only if the guest answers from a new boot.
+    mp_tear stop --force "$VM" >/dev/null 2>&1
+    mp_tear start "$VM" >/dev/null 2>&1
+    if await_boot "$before"; then
+      warns="$(mp_probe exec "$VM" -- sudo journalctl -b -1 -p warning -n 15 -q --no-pager 2>&1 | tr -d '\r' | paste -sd'|' -)"
+      failed="$(mp_probe exec "$VM" -- systemctl --failed --no-legend --plain 2>&1 | tr -d '\r' | paste -sd'|' -)"
+      fail "the VM never answered after its reboot, but did after a forced stop and start, so it boots; the boot before that logged: ${warns:-no warnings}; failed units now: ${failed:-none}"
+    else
+      fail "the VM never answered after its reboot, nor after a forced stop and start: it did not boot, or multipass cannot reach it, and which cannot be told from here"
+    fi
   else
     # recover-in-vm.sh left a marker and a list of what it restored; after the boot it checks they
     # survived, and that every key in TIMECRATE_CAPSTONE_SYSCTL is in effect as restored.
@@ -369,7 +397,7 @@ if [ -z "$problem" ]; then
                bash /home/ubuntu/recover-in-vm.sh --after-reboot 2>&1)"
     printf '%s\n' "$after"
     printf '%s' "$after" | grep -qE '^==== AFTER-REBOOT RESULT: [0-9]+ PASS / 0 FAIL' \
-      || fail "restored configuration did not survive the reboot: $(printf '%s' "$after" | grep '\[FAIL\]' | head -1)"
+      || fail "restored configuration did not survive the reboot: $(fail_lines "$after")"
   fi
 fi
 

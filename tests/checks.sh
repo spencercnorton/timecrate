@@ -2009,15 +2009,17 @@ case "$1" in
   list)   echo "Name,State,IPv4,Image"; echo "timecrate-capstone-vm,Running,192.0.2.2,Ubuntu";;
   launch) exit 0;;
   transfer) stat -c %s "$2" > "/tmp/t40/landed/$(key "${3#*:}")" 2>/dev/null; exit 0;;
-  restart) exit 0;;                      # the restart "succeeds" — and the guest never returns
   exec)
     shift; for a in "$@"; do last="$a"; done
     # After the reboot the guest does not merely fail — it BLOCKS, like a wedged daemon. If the
     # readiness probe inherited the long mp() timeout, 36 iterations of this would take hours.
-    # A fake that fails instantly (the first cut of T40) cannot tell those two apart.
-    [ -f /tmp/t40/rebooted ] && { sleep 300; exit 1; }
+    # A fake that fails instantly (the first cut of T40) cannot tell those two apart. The sleep
+    # holds no output pipe, so a timed-out probe's command substitution returns with it.
+    [ -f /tmp/t40/rebooted ] && { sleep 300 >/dev/null 2>&1; exit 1; }
     case "$*" in *"stat -c %s"*) cat "/tmp/t40/landed/$(key "$last")" 2>/dev/null || exit 1;;
-                 *recover-in-vm*) touch /tmp/t40/rebooted; echo "IN-VM RESULT: 12 PASS / 0 FAIL";; esac
+                 *boot_id*) echo 00000000-0000-4000-8000-000000000001;;
+                 *"systemctl reboot"*) touch /tmp/t40/rebooted;;   # accepted — and the guest never returns
+                 *recover-in-vm*) echo "==== IN-VM RESULT: 12 PASS / 0 FAIL ====";; esac
     exit 0;;
   stop|delete) exit 0;;
 esac
@@ -2041,7 +2043,7 @@ grep -q 'timeout "\$MP_TIMEOUT" multipass' "$CAP" \
 # The readiness probe must NOT inherit the long mp() bound: 36 iterations x 900s is nine hours,
 # which is the original hang with extra steps. The fake above blocks for 300s per probe, so a
 # probe using mp() could not have finished inside the elapsed-time assertion.
-grep -q 'mp_probe exec "\$VM" -- true' "$CAP" \
+grep -q 'boot_id(){ mp_probe exec "\$VM"' "$CAP" \
   && ok "and readiness probes use their own short bound, not the 900s launch/restart one" \
   || no "the reboot probe inherits the long mp() timeout — 36 x 900s is a nine-hour wait"
 rm -rf /tmp/t40 /root/timecrate-capstone-work.* 2>/dev/null
@@ -2761,6 +2763,131 @@ for bad in other empty; do
 done
 rm -rf /tmp/t63
 rm -f /usr/local/bin/rclone
+
+echo "== T64: the capstone decrypts on disk and fails closed; the guest reboots itself (3.0.1) =="
+# Ubuntu 26.04 mounts /tmp as a tmpfs of half the RAM, under 1 GiB in the 2 GB capstone VM, and
+# kits outgrew it. The in-VM decrypt to /tmp ran out of space and wrote no signature record; the
+# script read "no record" as a kit from before signing and went on, ignored the exit codes of zstd
+# and tar, and the run failed steps later on manifests it never checked had come out.
+RIV="$REPO/deploy/recover-in-vm.sh"
+code64="$(grep -vE '^[[:space:]]*#' "$RIV")"
+dline64="$(printf '%s\n' "$code64" | grep -E 'gpg .* -d ')"
+dec64="$(printf '%s\n' "$code64" | sed -n 's/^DEC=\([^;[:space:]]*\).*/\1/p')"
+if [ -z "$dline64" ]; then no "no gpg decrypt found in recover-in-vm.sh — this check no longer sees it"
+elif printf '%s %s\n' "$dline64" "$dec64" | grep -qE '(^|[^[:alnum:]_])/(tmp|dev/shm)/'; then
+  no "recover-in-vm.sh decrypts into /tmp, a RAM-backed tmpfs smaller than a kit"
+else ok "recover-in-vm.sh decrypts to disk-backed space, not /tmp"; fi
+printf '%s\n' "$code64" | grep -qiE 'unsigned|signature check n/a' \
+  && no "recover-in-vm.sh has a branch for an 'unsigned' kit again — a full disk produces exactly that" \
+  || ok "and no branch lets a kit through without a signature record"
+printf '%s\n' "$code64" | grep -q 'DECRYPTION_OKAY' && printf '%s\n' "$code64" | grep -q 'VALIDSIG' \
+  && printf '%s\n' "$code64" | grep -q 'PIPESTATUS' \
+  && ok "it requires DECRYPTION_OKAY and VALIDSIG, and reads the exit codes of zstd and tar" \
+  || no "recover-in-vm.sh no longer checks DECRYPTION_OKAY, VALIDSIG and the extract's exit codes"
+printf '%s\n' "$code64" | grep -qE "bash -c '[^']*[\$]M" \
+  && no "a single-quoted bash -c reads \$M, which is unset in the child shell" \
+  || ok "and no single-quoted child shell reads a variable it does not have"
+
+# The same script, run: a kit with no signature must stop it before anything is extracted, and a
+# signed one must still pass. It installs packages and writes under /etc, as it does in the VM.
+rm -rf /tmp/t64 /home/ubuntu/timecrate-in /restore; mkdir -p /tmp/t64/bin /home/ubuntu/timecrate-in
+IN64=/home/ubuntu/timecrate-in
+cp /tmp/tm/conf/timecrate-secret.asc "$IN64/escrow-key.asc"
+cp /tmp/tm/conf/timecrate-signing-public.asc "$IN64/signing-pub.asc"
+stage64(){ cp "$1" "$IN64/kit.tar.zst.gpg"; (cd "$IN64" && sha256sum kit.tar.zst.gpg > kit.sha256); }
+echo evil > /tmp/t64/evil
+tar -cf - -C /tmp/t64 evil | zstd -q --long=27 \
+  | GNUPGHOME=/tmp/tm/conf/gnupg gpg --batch --yes --trust-model always --cipher-algo AES256 \
+      --compress-algo none -e -r "$(cat /tmp/tm/conf/recipients.txt)" -o /tmp/t64/forged.gpg 2>/dev/null
+stage64 /tmp/t64/forged.gpg
+out64="$(bash "$RIV" 2>&1)"; rc64=$?
+[ "$rc64" != 0 ] && printf '%s' "$out64" | grep -q '\[FAIL\] kit NOT authenticated' \
+  && ok "a kit that decrypts but carries no signature FAILS in the VM" \
+  || no "an unsigned kit was not failed: rc=$rc64 $(printf '%s' "$out64" | grep -E 'S4|FAIL|PASS' | tail -3)"
+! printf '%s' "$out64" | grep -q '^S5' && [ ! -e /restore/evil ] \
+  && ok "and the run stops there, with nothing extracted" \
+  || no "the run went on past an unauthenticated kit"
+TIMECRATE_INCLUDE=/tmp/inc.small TIMECRATE_EXCLUDE=/tmp/exc.small TIMECRATE_STAGING=/tmp/t64/staging \
+  "$TC" backup --no-upload --force >/tmp/t64/bk.out 2>&1
+good64="$(ls /tmp/t64/staging/timecrate-*.tar.zst.gpg 2>/dev/null | head -1)"
+if [ -z "$good64" ]; then no "could not write a signed kit for T64: $(tail -1 /tmp/t64/bk.out)"
+else
+  rm -rf /restore; stage64 "$good64"
+  out64g="$(bash "$RIV" 2>&1)"
+  printf '%s' "$out64g" | grep -q '\[PASS\] kit decrypted, signed by' \
+    && printf '%s' "$out64g" | grep -q '\[PASS\] extracted (.*TIMECRATE-MANIFESTS)' \
+    && ok "and a signed kit still decrypts, verifies and extracts whole" \
+    || no "a signed kit no longer passes S4: $(printf '%s' "$out64g" | grep -A3 '^S4' | tail -3)"
+  [ ! -e "$IN64/kit.tar.zst.gpg" ] && [ ! -e "$IN64/kit.tar.zst" ] \
+    && ok "and neither the kit nor its plaintext is left taking up the VM's disk" \
+    || no "the verified kit or its plaintext was left on the VM's disk"
+fi
+rm -rf /home/ubuntu/timecrate-in /restore /etc/timecrate-capstone-marker /etc/timecrate-capstone-restored
+
+# The reboot. `multipass restart` waits on the daemon's own SSH session, and that wait has run out
+# its bound while the guest booted fine. The guest now reboots itself, and only an answer from a
+# NEW boot counts. When none comes, one forced stop and start tells a guest that cannot boot from
+# a multipass that lost its way back in, and the alert carries what that boot logged.
+mkdir -p /tmp/t64/conf /tmp/t64/landed
+printf 'key\n' > /tmp/t64/conf/timecrate-secret.asc
+printf 'pub\n' > /tmp/t64/conf/timecrate-signing-public.asc
+printf 'rc\n'  > /tmp/t64/rclone.conf
+printf '#!/bin/bash\nfor a in "$@"; do last="$a"; done\nprintf "kit\\n" > "$last" 2>/dev/null\nexit 0\n' > /tmp/t64/bin/rclone
+printf '#!/bin/bash\n[ "$1" = list ] && { echo "timecrate-2026-01-01_00-00-00.tar.zst.gpg"; exit 0; }\nexit 0\n' > /tmp/t64/bin/timecrate
+cat > /tmp/t64/bin/multipass <<'FAKE'
+#!/bin/bash
+S=/tmp/t64; key(){ echo "$1" | tr / _; }
+echo "$*" >> $S/calls
+case "$1" in
+  list)     echo "Name,State,IPv4,Image"; [ -f $S/deleted ] || echo "timecrate-capstone-vm,Running,192.0.2.2,Ubuntu";;
+  launch)   rm -f $S/deleted;;
+  transfer) stat -c %s "$2" > "$S/landed/$(key "${3#*:}")" 2>/dev/null;;
+  delete)   touch $S/deleted;;
+  start)    echo 00000000-0000-4000-8000-0000000000ff > $S/boot;;
+  exec)
+    shift; for a in "$@"; do last="$a"; done
+    case "$*" in
+      *"stat -c %s"*)       cat "$S/landed/$(key "$last")" 2>/dev/null || exit 1;;
+      *boot_id*)            cat $S/boot;;
+      *"systemctl reboot"*) [ "$(cat $S/mode)" = healthy ] && echo 00000000-0000-4000-8000-000000000002 > $S/boot; exit 255;;
+      *--after-reboot*)     echo "  [PASS] marker"; echo "==== AFTER-REBOOT RESULT: 1 PASS / 0 FAIL ====";;
+      *recover-in-vm*)      if [ "$(cat $S/mode)" != failed ]; then echo "==== IN-VM RESULT: 9 PASS / 0 FAIL ===="
+                            else printf '  [FAIL] first thing\n  [FAIL] second thing\n==== IN-VM RESULT: 7 PASS / 2 FAIL ====\n'; fi;;
+      *journalctl*)         echo "kernel: a warning from the boot that never answered";;
+      *"systemctl --failed"*) echo "broken.service loaded failed failed Broken";;
+    esac;;
+esac
+exit 0
+FAKE
+chmod +x /tmp/t64/bin/*
+t64run(){ rm -f /tmp/t64/deleted /tmp/t64/calls; echo 00000000-0000-4000-8000-000000000001 > /tmp/t64/boot; echo "$1" > /tmp/t64/mode
+  env TIMECRATE_USER=root TIMECRATE_CONF=/tmp/t64/conf TIMECRATE_RCLONE_CONF=/tmp/t64/rclone.conf \
+    PATH=/tmp/t64/bin:/usr/sbin:/usr/bin:/sbin:/bin TIMECRATE_CAPSTONE_VM=timecrate-capstone-vm \
+    TIMECRATE_CAPSTONE_REBOOT_TRIES=2 bash "$CAP" 2>&1; }
+out64h="$(t64run healthy)"
+printf '%s' "$out64h" | grep -q 'CAPSTONE PASSED' && printf '%s' "$out64h" | grep -q 'AFTER-REBOOT RESULT' \
+  && ok "a guest that reboots itself and answers from a new boot passes, after-reboot checks and all" \
+  || no "the healthy reboot did not pass: $(printf '%s' "$out64h" | tail -2)"
+grep -q '^restart' /tmp/t64/calls \
+  && no "the capstone still calls multipass restart" || ok "and multipass restart is never called"
+out64f="$(t64run failed)"
+printf '%s' "$out64f" | grep -q 'CAPSTONE FAILED.*first thing; second thing' \
+  && ok "the alert lists every in-VM [FAIL] line, not only the first" \
+  || no "the in-VM failures were not all reported: $(printf '%s' "$out64f" | grep 'CAPSTONE FAILED')"
+# A recovery that stopped early wrote no marker: rebooting it only adds a false second cause.
+! grep -q 'systemctl reboot' /tmp/t64/calls && ! printf '%s' "$out64f" | grep 'CAPSTONE FAILED' | grep -q reboot \
+  && ok "and a failed in-VM run is not rebooted, so the alert names only the real cause" \
+  || no "a failed in-VM run was still rebooted: $(printf '%s' "$out64f" | grep 'CAPSTONE FAILED')"
+out64w="$(t64run wedged)"
+printf '%s' "$out64w" | grep -q 'never answered after its reboot, but did after a forced stop and start' \
+  && grep -q '^stop --force' /tmp/t64/calls \
+  && ok "a guest still on its old boot is not taken as rebooted; one forced stop and start follows" \
+  || no "the no-new-boot path did not force a stop and start: $(printf '%s' "$out64w" | grep 'CAPSTONE FAILED')"
+printf '%s' "$out64w" | grep -q 'a warning from the boot that never answered' \
+  && printf '%s' "$out64w" | grep -q 'broken.service' \
+  && ok "and the alert carries that boot's warnings and the failed units" \
+  || no "the forced boot's journal and failed units are not in the alert"
+rm -rf /tmp/t64 /root/timecrate-capstone-work.* 2>/dev/null
 
 echo "==== RESULT: $PASS PASS / $FAIL FAIL ===="
 [ "$FAIL" -eq 0 ]
